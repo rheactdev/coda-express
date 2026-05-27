@@ -29,6 +29,10 @@ type CodaColumn = {
   formula?: string;
   format?: {
     type?: string;
+    isArray?: boolean;
+    limit?: number;
+    maxItems?: number;
+    maxSelectedItems?: number;
     tableId?: string;
     table?: {
       id?: string;
@@ -49,6 +53,7 @@ type TargetColumn = {
   type: string;
   description: string | null;
   existingOptions: string[];
+  allowsMultipleValues: boolean;
   relationTableId?: string;
 };
 
@@ -144,7 +149,7 @@ app.post(
 
     await context.run("save-to-coda", () =>
       runWorkflowStep("save-to-coda", () =>
-        saveToCoda(input.docId, input.tableId, input.codaToken, extracted),
+        saveToCoda(input.docId, input.tableId, input.codaToken, extracted, codaSchema.columns),
       ),
     );
   }),
@@ -384,6 +389,7 @@ async function fetchCodaSchema(
       type,
       description: column.description || null,
       existingOptions,
+      allowsMultipleValues: allowsMultipleValues(column),
       relationTableId,
     });
   }
@@ -466,11 +472,13 @@ async function saveToCoda(
   tableId: string,
   codaToken: string,
   extracted: Record<string, unknown>,
+  columns: TargetColumn[],
 ): Promise<{ id?: string; requestId?: string }> {
+  const columnMap = new Map(columns.map((column) => [column.name, column]));
   const cells = Object.entries(extracted)
     .map(([column, value]) => ({
       column,
-      value: toCodaCellValue(value, column),
+      value: toCodaCellValue(value, columnMap.get(column) ?? column),
     }))
     .filter(
       (cell): cell is { column: string; value: Exclude<CodaCellValue, null> } =>
@@ -498,7 +506,9 @@ async function saveToCoda(
 type CodaScalarValue = boolean | number | string;
 type CodaCellValue = CodaScalarValue | CodaScalarValue[] | null;
 
-function toCodaCellValue(value: unknown, columnName?: string): CodaCellValue | undefined {
+function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCellValue | undefined {
+  const columnName = typeof column === "string" ? column : column?.name;
+
   if (value === undefined) {
     return undefined;
   }
@@ -512,9 +522,18 @@ function toCodaCellValue(value: unknown, columnName?: string): CodaCellValue | u
   }
 
   if (Array.isArray(value)) {
-    return value
+    const values = value
       .map(toCodaScalarValue)
       .filter((item): item is CodaScalarValue => item !== undefined);
+
+    if (typeof column !== "string" && column?.allowsMultipleValues === false) {
+      const selectedValue = selectMostSpecificValue(values);
+      return typeof selectedValue === "string"
+        ? normalizeCodaStringValue(selectedValue, columnName)
+        : selectedValue;
+    }
+
+    return values;
   }
 
   const scalar = toCodaScalarValue(value);
@@ -613,10 +632,17 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
   const description = buildColumnDescription(column);
 
   if (type.includes("relation") || column.relationTableId) {
+    if (column.allowsMultipleValues === false) {
+      return z
+        .string()
+        .nullable()
+        .describe(`${description} Return exactly one related item. If multiple options fit, choose the most specific option.`);
+    }
+
     return z
       .union([z.string(), z.array(z.string())])
       .nullable()
-      .describe(`${description} Return a string for one related item or an array of strings for multiple related items.`);
+      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Prefer the most specific matching options.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -632,6 +658,13 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
   }
 
   if (type.includes("select") || type.includes("lookup") || type.includes("person")) {
+    if (column.allowsMultipleValues === false) {
+      return z
+        .string()
+        .nullable()
+        .describe(`${description} Return exactly one value. If multiple options fit, choose the most specific option.`);
+    }
+
     return z
       .union([z.string(), z.array(z.string())])
       .nullable()
@@ -659,6 +692,10 @@ function buildColumnDescription(column: TargetColumn): string {
 
   if (column.existingOptions.length > 0) {
     parts.push(`Existing options: ${column.existingOptions.join(", ")}.`);
+  }
+
+  if (isMultiValueType(column) && column.allowsMultipleValues === false) {
+    parts.push("This column accepts only one value; choose the most specific matching option.");
   }
 
   return parts.join(" ");
@@ -726,6 +763,32 @@ function normalizeCodaType(column: CodaColumn): string {
   return column.format?.type ?? column.type ?? "Text";
 }
 
+function allowsMultipleValues(column: CodaColumn): boolean {
+  const format = column.format;
+
+  if (typeof format?.isArray === "boolean") {
+    return format.isArray;
+  }
+
+  const configuredLimit = format?.maxSelectedItems ?? format?.maxItems ?? format?.limit;
+  if (configuredLimit === 1) {
+    return false;
+  }
+
+  return true;
+}
+
+function isMultiValueType(column: TargetColumn): boolean {
+  const type = column.type.toLowerCase();
+  return (
+    type.includes("relation") ||
+    type.includes("select") ||
+    type.includes("lookup") ||
+    type.includes("person") ||
+    Boolean(column.relationTableId)
+  );
+}
+
 function getRelationTableId(column: CodaColumn): string | undefined {
   const type = normalizeCodaType(column).toLowerCase();
   if (!type.includes("relation") && !column.format?.tableId && !column.format?.table?.id) {
@@ -765,6 +828,73 @@ function firstStringValue(values: Record<string, unknown> | undefined): string |
 
 function dedupeStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function selectMostSpecificValue(values: CodaScalarValue[]): CodaScalarValue | undefined {
+  if (values.length === 0) {
+    return undefined;
+  }
+
+  const strings = values.filter((value): value is string => typeof value === "string");
+  if (strings.length === 0) {
+    return values[0];
+  }
+
+  return strings.reduce((best, candidate) =>
+    getSpecificityScore(candidate, strings) > getSpecificityScore(best, strings) ? candidate : best,
+  );
+}
+
+function getSpecificityScore(value: string, candidates: string[]): number {
+  const normalized = normalizeComparableText(value);
+  const tokens = normalized.split(" ").filter(Boolean);
+  const containsAnotherCandidate = candidates.some((candidate) => {
+    const candidateText = normalizeComparableText(candidate);
+    return candidateText !== normalized && normalized.includes(candidateText);
+  });
+  const containedByAnotherCandidate = candidates.some((candidate) => {
+    const candidateText = normalizeComparableText(candidate);
+    return candidateText !== normalized && candidateText.includes(normalized);
+  });
+
+  return (
+    normalized.length +
+    tokens.length * 2 +
+    (containsAnotherCandidate ? 4 : 0) -
+    (containedByAnotherCandidate ? 4 : 0) -
+    getBroadCategoryPenalty(tokens)
+  );
+}
+
+function getBroadCategoryPenalty(tokens: string[]): number {
+  const broadCategoryTerms = new Set([
+    "accessory",
+    "accessories",
+    "apparel",
+    "clothes",
+    "clothing",
+    "custom",
+    "general",
+    "gift",
+    "gifts",
+    "item",
+    "items",
+    "merch",
+    "merchandise",
+    "misc",
+    "other",
+    "product",
+    "products",
+  ]);
+
+  return tokens.reduce((penalty, token) => penalty + (broadCategoryTerms.has(token) ? 6 : 0), 0);
+}
+
+function normalizeComparableText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function getFirecrawlMarkdown(response: unknown): string {

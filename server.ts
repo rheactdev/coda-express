@@ -189,13 +189,36 @@ function parseSaveBookmarkPayload(
     return { ok: false, error: "Request must include a Coda token in Authorization: Bearer ... or codaToken." };
   }
 
+  const docId = normalizeCodaIdentifier(result.data.docId);
+  const tableId = normalizeCodaIdentifier(result.data.tableId);
+
   return {
     ok: true,
     data: {
       ...result.data,
-      codaToken,
+      docId,
+      tableId,
+      codaToken: codaToken.replace(/^Bearer\s+/i, "").trim(),
     },
   };
+}
+
+function normalizeCodaIdentifier(value: string): string {
+  const trimmed = value.trim();
+
+  try {
+    const url = new URL(trimmed);
+    const pathParts = url.pathname.split("/").filter(Boolean);
+    const lastPathPart = pathParts.at(-1);
+    const hash = url.hash.slice(1);
+    return hash || extractTrailingCodaId(lastPathPart) || trimmed;
+  } catch {
+    return extractTrailingCodaId(trimmed) || trimmed;
+  }
+}
+
+function extractTrailingCodaId(value: string | undefined): string | undefined {
+  return value?.match(/(?:^|_)([A-Za-z]+[-_][A-Za-z0-9_-]+)$/)?.[1];
 }
 
 function getBearerToken(req: Request): string | undefined {
@@ -252,9 +275,11 @@ async function fetchCodaSchema(
   tableId: string,
   codaToken: string,
 ): Promise<{ table: CodaTable; columns: TargetColumn[] }> {
+  const encodedDocId = encodeURIComponent(docId);
+  const encodedTableId = encodeURIComponent(tableId);
   const [table, columnsResponse] = await Promise.all([
-    codaFetch<CodaTable>(`/docs/${docId}/tables/${tableId}`, codaToken),
-    codaFetch<{ items: CodaColumn[] }>(`/docs/${docId}/tables/${tableId}/columns`, codaToken),
+    codaFetch<CodaTable>(`/docs/${encodedDocId}/tables/${encodedTableId}`, codaToken),
+    codaFetch<{ items: CodaColumn[] }>(`/docs/${encodedDocId}/tables/${encodedTableId}/columns`, codaToken),
   ]);
 
   const columns: TargetColumn[] = [];
@@ -292,7 +317,7 @@ async function fetchRelationOptions(
   codaToken: string,
 ): Promise<string[]> {
   const rows = await codaFetch<{ items: Array<{ name?: string; values?: Record<string, unknown> }> }>(
-    `/docs/${docId}/tables/${relationTableId}/rows?useColumnNames=true&limit=500`,
+    `/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(relationTableId)}/rows?useColumnNames=true&limit=500`,
     codaToken,
   );
 
@@ -369,7 +394,7 @@ async function saveToCoda(
     throw new Error("No extracted cells to save.");
   }
 
-  return codaFetch(`/docs/${docId}/tables/${tableId}/rows`, codaToken, {
+  return codaFetch(`/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(tableId)}/rows`, codaToken, {
     method: "POST",
     body: JSON.stringify({
       rows: [{ cells }],
@@ -447,11 +472,16 @@ async function codaFetch<T>(
     },
   });
 
+  const responseText = await response.text();
+
   if (!response.ok) {
-    throw new Error(`Coda API request failed with status ${response.status}.`);
+    const responseDetails = getCodaErrorDetails(responseText);
+    throw new Error(
+      `Coda API request failed with status ${response.status}${responseDetails ? `: ${responseDetails}` : ""}.`,
+    );
   }
 
-  return (await response.json()) as T;
+  return JSON.parse(responseText) as T;
 }
 
 function isWritableColumn(column: CodaColumn): boolean {
@@ -530,6 +560,20 @@ function getFirecrawlMetadata(response: unknown): Record<string, unknown> {
   const metadata = asRecord(topLevel?.metadata) ?? asRecord(data?.metadata);
 
   return metadata ?? {};
+}
+
+function getCodaErrorDetails(responseText: string): string {
+  if (!responseText) {
+    return "";
+  }
+
+  try {
+    const parsed = JSON.parse(responseText) as unknown;
+    const record = asRecord(parsed);
+    return asString(record?.message) ?? asString(record?.error) ?? "";
+  } catch {
+    return responseText.slice(0, 250);
+  }
 }
 
 function getNestedRecord(value: unknown, key: string): Record<string, unknown> | undefined {

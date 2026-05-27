@@ -391,9 +391,12 @@ async function saveToCoda(
   const cells = Object.entries(extracted)
     .map(([column, value]) => ({
       column,
-      value: toCodaCellValue(value),
+      value: toCodaCellValue(value, column),
     }))
-    .filter((cell): cell is { column: string; value: CodaCellValue } => cell.value !== undefined);
+    .filter(
+      (cell): cell is { column: string; value: Exclude<CodaCellValue, null> } =>
+        cell.value !== undefined && cell.value !== null,
+    );
 
   if (cells.length === 0) {
     throw new Error("No extracted cells to save.");
@@ -416,12 +419,16 @@ async function saveToCoda(
 type CodaScalarValue = boolean | number | string;
 type CodaCellValue = CodaScalarValue | CodaScalarValue[] | null;
 
-function toCodaCellValue(value: unknown): CodaCellValue | undefined {
+function toCodaCellValue(value: unknown, columnName?: string): CodaCellValue | undefined {
   if (value === undefined) {
     return undefined;
   }
 
-  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+  if (typeof value === "string") {
+    return normalizeCodaStringValue(value, columnName);
+  }
+
+  if (value === null || typeof value === "number" || typeof value === "boolean") {
     return value;
   }
 
@@ -467,6 +474,49 @@ function toCodaScalarValue(value: unknown): CodaScalarValue | undefined {
   }
 
   return String(value);
+}
+
+function normalizeCodaStringValue(value: string, columnName?: string): string {
+  if (columnName && isUrlColumnName(columnName)) {
+    return normalizeUrlValue(value);
+  }
+
+  return value;
+}
+
+function isUrlColumnName(columnName: string): boolean {
+  const normalizedName = columnName.toLowerCase();
+  return /\b(url|link|href|source)\b/.test(normalizedName);
+}
+
+function normalizeUrlValue(value: string): string {
+  return normalizeAmazonUrl(value) ?? value;
+}
+
+function normalizeAmazonUrl(value: string): string | undefined {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(value);
+  } catch {
+    return undefined;
+  }
+
+  const hostname = parsedUrl.hostname.replace(/^www\./i, "").toLowerCase();
+  if (hostname !== "amazon.com" && !hostname.endsWith(".amazon.com")) {
+    return undefined;
+  }
+
+  const asin =
+    parsedUrl.pathname.match(/\/(?:dp|gp\/product|exec\/obidos\/ASIN)\/([A-Z0-9]{10})(?:[/?]|$)/i)?.[1] ??
+    parsedUrl.searchParams.get("asin") ??
+    parsedUrl.searchParams.get("pd_rd_i");
+
+  if (!asin) {
+    return undefined;
+  }
+
+  return `https://www.amazon.com/dp/${asin.toUpperCase()}`;
 }
 
 function buildExtractionSchema(columns: TargetColumn[]) {
@@ -523,11 +573,30 @@ function buildColumnDescription(column: TargetColumn): string {
     parts.push(column.description);
   }
 
+  const extractionHint = getColumnExtractionHint(column.name);
+  if (extractionHint) {
+    parts.push(extractionHint);
+  }
+
   if (column.existingOptions.length > 0) {
     parts.push(`Existing options: ${column.existingOptions.join(", ")}.`);
   }
 
   return parts.join(" ");
+}
+
+function getColumnExtractionHint(columnName: string): string | undefined {
+  const normalizedName = columnName.toLowerCase();
+
+  if (/\b(sku|model|model number|item number|product code|part number|asin)\b/.test(normalizedName)) {
+    return [
+      "For SKU-like fields, use the product identifier shown on the page.",
+      "Accept labels such as SKU, Model Number, Model, Item Number, Item Model Number, Product Code, Part Number, Style Number, or ASIN.",
+      "On Amazon pages, prefer Model Number or Item Model Number when present; otherwise use ASIN.",
+    ].join(" ");
+  }
+
+  return undefined;
 }
 
 async function codaFetch<T>(

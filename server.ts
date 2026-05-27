@@ -205,7 +205,8 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
     return await run();
   } catch (error) {
     logSanitizedError(stepName, error);
-    throw new Error(`Workflow step failed: ${stepName}`);
+    const details = getSanitizedErrorDetails(error);
+    throw new Error(`Workflow step failed: ${stepName}${details ? `: ${details}` : ""}`);
   }
 }
 
@@ -225,6 +226,12 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
   }
 
   const response = await scrape.call(client, url, scrapeOptions);
+  const responseRecord = asRecord(response);
+
+  if (responseRecord?.success === false) {
+    const error = asString(responseRecord.error) ?? "Unknown Firecrawl scrape error.";
+    throw new Error(`Firecrawl scrape failed: ${error}`);
+  }
 
   const markdown = getFirecrawlMarkdown(response);
   if (!markdown) {
@@ -538,5 +545,35 @@ function asString(value: unknown): string | undefined {
 }
 
 function logSanitizedError(step: string, error: unknown): void {
-  console.error(`Workflow failure in step "${step}".`);
+  const details = getSanitizedErrorDetails(error);
+  console.error(`Workflow failure in step "${step}".${details ? ` ${details}` : ""}`);
+}
+
+function getSanitizedErrorDetails(error: unknown): string {
+  const errorRecord = asRecord(error);
+  const status = errorRecord?.statusCode ?? errorRecord?.status ?? errorRecord?.code;
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : asString(errorRecord?.message) ?? asString(errorRecord?.error);
+
+  const parts: string[] = [];
+
+  if (status !== undefined) {
+    parts.push(`status=${String(status)}`);
+  }
+
+  if (message) {
+    parts.push(`message=${sanitizeErrorMessage(message)}`);
+  }
+
+  return parts.join(" ");
+}
+
+function sanitizeErrorMessage(message: string): string {
+  return message
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/(api[_-]?key|token|secret|password)=([^&\s]+)/gi, "$1=[redacted]")
+    .slice(0, 500);
 }

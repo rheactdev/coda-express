@@ -684,10 +684,10 @@ async function extractData(
       "Extract JSON for a Coda table from scraped page data.",
       "Use exact keys only. If absent, return null.",
       "Prefer structured product data over markdown.",
-      "Relations/selects: use an existing option only for a clear semantic match.",
+      "Relations/selects: use an existing option only for an exact, synonym, subtype, or parent-child match.",
+      "Adjacent use-cases are not matches. Prefer a new precise tag over a vague existing bucket.",
       "If no existing option precisely describes the product, create a concise new product-level tag.",
       "Avoid near-duplicate tags. If an existing compound option covers the product subtype, use it.",
-      "Do not force vague adjacent tags like Journaling for a Planner.",
       "For product categories/tags, reason from the whole product description.",
       "If a set contains one kind of item, use that item type. If it contains multiple different item types, use the broader set/category tag when available.",
       "For single-select fields where multiple options fit, choose the one most useful for a user browsing or filtering the table later.",
@@ -957,13 +957,13 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one related item. Use an existing option if it clearly matches or covers the subtype. Otherwise create a concise new product-level tag. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
+        .describe(`${description} Return exactly one related item. Use an existing option only for an exact, synonym, subtype, or parent-child match. Adjacent use-cases are not matches; prefer a new precise tag over a vague existing bucket. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
     }
 
     return z
       .union([z.string(), z.array(z.string())])
       .nullable()
-      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Use existing options when they clearly match or cover the subtype. Otherwise create concise new product-level tags. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
+      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Use existing options only for exact, synonym, subtype, or parent-child matches. Adjacent use-cases are not matches; prefer new precise tags over vague existing buckets. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -1020,7 +1020,7 @@ function buildColumnDescription(column: TargetColumn): string {
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {
-    parts.push("This column accepts only one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. Use an existing option if it clearly matches or covers the subtype; otherwise create a concise new tag. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.");
+    parts.push("This column accepts only one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. Use an existing option only for an exact, synonym, subtype, or parent-child match. Adjacent use-cases are not matches; prefer a new precise tag over a vague existing bucket. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.");
   }
 
   return parts.join(" ");

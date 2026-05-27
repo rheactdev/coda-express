@@ -132,11 +132,15 @@ app.post(
   }),
 );
 
-const port = Number(process.env.PORT ?? 3000);
+if (!process.env.VERCEL) {
+  const port = Number(process.env.PORT ?? 3000);
 
-app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
-});
+  app.listen(port, () => {
+    console.log(`Server listening on port ${port}`);
+  });
+}
+
+export default app;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -147,12 +151,6 @@ function requireEnv(name: string): string {
 }
 
 function getWorkflowUrl(req: Request): string {
-  const configuredBaseUrl = process.env.UPSTASH_WORKFLOW_URL ?? process.env.PUBLIC_BASE_URL;
-
-  if (configuredBaseUrl) {
-    return `${configuredBaseUrl.replace(/\/$/, "")}${WORKFLOW_PATH}`;
-  }
-
   const forwardedProto = req.header("x-forwarded-proto");
   const protocol = forwardedProto ?? req.protocol;
   return `${protocol}://${req.get("host")}${WORKFLOW_PATH}`;

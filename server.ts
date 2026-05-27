@@ -91,7 +91,7 @@ app.post("/api/save-bookmark", async (req: Request, res: Response) => {
     const { workflowRunId } = await workflowClient.trigger({
       url: workflowUrl,
       body: payload.data,
-      retries: 3,
+      retries: 0,
       redact: {
         body: true,
       },

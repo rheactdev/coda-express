@@ -59,7 +59,7 @@ type ScrapeResult = {
 
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
-const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL ?? "accounts/fireworks/models/kimi-k2-instruct";
+const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2-instruct";
 
 const app = express();
 
@@ -237,8 +237,7 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
     return await run();
   } catch (error) {
     logSanitizedError(stepName, error);
-    const details = getSanitizedErrorDetails(error);
-    throw new Error(`Workflow step failed: ${stepName}${details ? `: ${details}` : ""}`);
+    throw new Error(`Workflow step failed: ${stepName}`);
   }
 }
 
@@ -593,35 +592,5 @@ function asString(value: unknown): string | undefined {
 }
 
 function logSanitizedError(step: string, error: unknown): void {
-  const details = getSanitizedErrorDetails(error);
-  console.error(`Workflow failure in step "${step}".${details ? ` ${details}` : ""}`);
-}
-
-function getSanitizedErrorDetails(error: unknown): string {
-  const errorRecord = asRecord(error);
-  const status = errorRecord?.statusCode ?? errorRecord?.status ?? errorRecord?.code;
-  const message = error instanceof Error
-    ? error.message
-    : typeof error === "string"
-      ? error
-      : asString(errorRecord?.message) ?? asString(errorRecord?.error);
-
-  const parts: string[] = [];
-
-  if (status !== undefined) {
-    parts.push(`status=${String(status)}`);
-  }
-
-  if (message) {
-    parts.push(`message=${sanitizeErrorMessage(message)}`);
-  }
-
-  return parts.join(" ");
-}
-
-function sanitizeErrorMessage(message: string): string {
-  return message
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
-    .replace(/(api[_-]?key|token|secret|password)=([^&\s]+)/gi, "$1=[redacted]")
-    .slice(0, 500);
+  console.error(`Workflow failure in step "${step}".`);
 }

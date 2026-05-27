@@ -3,6 +3,7 @@ import { config } from "dotenv";
 import { Client } from "@upstash/workflow";
 import { serve } from "@upstash/workflow/express";
 import Firecrawl from "@mendable/firecrawl-js";
+import { createFireworks } from "@ai-sdk/fireworks";
 import { generateObject } from "ai";
 import { z, type ZodTypeAny } from "zod";
 
@@ -58,7 +59,7 @@ type ScrapeResult = {
 
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
-const MODEL = "moonshotai/Kimi-K2.6";
+const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL ?? "accounts/fireworks/models/kimi-k2-instruct";
 
 const app = express();
 
@@ -71,6 +72,10 @@ const workflowClient = new Client({
 
 const firecrawl = new Firecrawl({
   apiKey: requireSecretEnv("FIRECRAWL_API_KEY"),
+});
+
+const fireworks = createFireworks({
+  apiKey: requireSecretEnv("FIREWORKS_API_KEY"),
 });
 
 app.post("/api/save-bookmark", async (req: Request, res: Response) => {
@@ -342,13 +347,8 @@ async function extractData(
     .join("\n");
 
   const { object } = await generateObject({
-    model: MODEL,
+    model: fireworks(FIREWORKS_MODEL),
     schema,
-    providerOptions: {
-      gateway: {
-        zeroDataRetention: true,
-      },
-    },
     system: [
       "You extract structured data for a Coda table from scraped webpage markdown.",
       "Never hallucinate. If a value for a column is not present in the markdown or metadata, return null.",

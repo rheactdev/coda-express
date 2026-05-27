@@ -12,6 +12,10 @@ type SaveBookmarkPayload = {
   url: string;
   docId: string;
   tableId: string;
+  codaToken?: string;
+};
+
+type WorkflowSaveBookmarkPayload = SaveBookmarkPayload & {
   codaToken: string;
 };
 
@@ -70,7 +74,7 @@ const firecrawl = new Firecrawl({
 });
 
 app.post("/api/save-bookmark", async (req: Request, res: Response) => {
-  const payload = parseSaveBookmarkPayload(req.body);
+  const payload = parseSaveBookmarkPayload(req.body, getBearerToken(req));
 
   if (!payload.ok) {
     res.status(400).json({ error: payload.error });
@@ -100,9 +104,9 @@ app.post("/api/save-bookmark", async (req: Request, res: Response) => {
 
 app.post(
   WORKFLOW_PATH,
-  serve<SaveBookmarkPayload>(async (context) => {
+  serve<WorkflowSaveBookmarkPayload>(async (context) => {
     const payload = context.requestPayload;
-    const parsed = parseSaveBookmarkPayload(payload);
+    const parsed = parseSaveBookmarkPayload(payload, payload.codaToken);
 
     if (!parsed.ok) {
       throw new Error("Invalid workflow payload.");
@@ -158,20 +162,39 @@ function getWorkflowUrl(req: Request): string {
 
 function parseSaveBookmarkPayload(
   body: unknown,
-): { ok: true; data: SaveBookmarkPayload } | { ok: false; error: string } {
+  codaTokenFromAuth?: string,
+): { ok: true; data: WorkflowSaveBookmarkPayload } | { ok: false; error: string } {
   const schema = z.object({
     url: z.string().url(),
     docId: z.string().min(1),
     tableId: z.string().min(1),
-    codaToken: z.string().min(1),
+    codaToken: z.string().min(1).optional(),
   });
 
   const result = schema.safeParse(body);
   if (!result.success) {
-    return { ok: false, error: "Request must include url, docId, tableId, and codaToken." };
+    return { ok: false, error: "Request must include url, docId, and tableId." };
   }
 
-  return { ok: true, data: result.data };
+  const codaToken = codaTokenFromAuth ?? result.data.codaToken;
+
+  if (!codaToken) {
+    return { ok: false, error: "Request must include a Coda token in Authorization: Bearer ... or codaToken." };
+  }
+
+  return {
+    ok: true,
+    data: {
+      ...result.data,
+      codaToken,
+    },
+  };
+}
+
+function getBearerToken(req: Request): string | undefined {
+  const authorization = req.header("authorization");
+  const match = authorization?.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim();
 }
 
 async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Promise<T> {
@@ -206,10 +229,6 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
   }
 
   const metadata = getFirecrawlMetadata(response);
-
-  if (process.env.NODE_ENV === "development") {
-    console.log("Firecrawl scrape metadata", metadata);
-  }
 
   return { markdown, metadata };
 }
@@ -315,10 +334,6 @@ async function extractData(
       scraped.markdown,
     ].join("\n"),
   });
-
-  if (process.env.NODE_ENV === "development") {
-    console.log("AI extraction result", object);
-  }
 
   return object as Record<string, unknown>;
 }
@@ -520,10 +535,5 @@ function asString(value: unknown): string | undefined {
 }
 
 function logSanitizedError(step: string, error: unknown): void {
-  if (process.env.NODE_ENV === "development" && error instanceof Error) {
-    console.error(`Workflow failure in step "${step}". ${error.message}`);
-    return;
-  }
-
   console.error(`Workflow failure in step "${step}".`);
 }

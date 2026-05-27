@@ -68,6 +68,13 @@ const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
 const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2p6";
 const API_KEY = requireEnv("API_KEY");
+const MAX_MARKDOWN_CHARS = 18_000;
+const MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA = 8_000;
+const MAX_METADATA_CHARS = 3_000;
+const MAX_STRUCTURED_DATA_CHARS = 6_000;
+const MAX_COLUMN_DESCRIPTION_CHARS = 240;
+const MAX_EXISTING_OPTIONS_IN_PROMPT = 40;
+const MAX_EXISTING_OPTION_CHARS = 80;
 
 const app = express();
 
@@ -446,48 +453,61 @@ async function extractData(
   codaSchema: { table: CodaTable; columns: TargetColumn[] },
 ): Promise<Record<string, unknown>> {
   const schema = buildExtractionSchema(codaSchema.columns);
-  const relationContext = codaSchema.columns
-    .filter((column) => column.existingOptions.length > 0)
-    .map(
-      (column) =>
-        `- ${column.name}: ${column.existingOptions.map((option) => JSON.stringify(option)).join(", ")}`,
-    )
-    .join("\n");
+  const hasStructuredData = Boolean(scraped.structuredData);
+  const markdownBudget = hasStructuredData ? MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA : MAX_MARKDOWN_CHARS;
 
   const { object } = await generateObject({
     model: fireworksExtractionModel,
     schema,
     maxRetries: 0,
     system: [
-      "You extract structured data for a Coda table from scraped webpage markdown.",
-      "Never hallucinate. If a value for a column is not present in the markdown or metadata, return null.",
-      "Use the exact schema keys provided. Do not add extra fields.",
-      "For relation columns, first map the context to an existing option string when a reasonable match exists.",
-      "Only generate a new fallback string for a relation column if no existing option fits.",
-      "Use concise scalar values. Preserve source facts and avoid commentary.",
+      "Extract JSON for a Coda table from scraped page data.",
+      "Use exact keys only. If absent, return null.",
+      "Prefer structured product data over markdown.",
+      "Relations/selects: use existing options when they fit; invent only if none fit.",
+      "Be concise. No commentary.",
     ].join("\n"),
     prompt: [
-      `Target Coda table: ${codaSchema.table.name}`,
-      codaSchema.table.description ? `Table description: ${codaSchema.table.description}` : "",
-      "",
-      "Target columns:",
-      JSON.stringify(codaSchema.columns, null, 2),
-      "",
-      relationContext ? `Allowed existing relation/options:\n${relationContext}` : "",
-      "",
-      "Scraped metadata:",
-      JSON.stringify(scraped.metadata, null, 2),
-      "",
+      `table=${codaSchema.table.name}`,
+      codaSchema.table.description ? `tableDescription=${truncateString(codaSchema.table.description, 300)}` : "",
+      `columns=${stringifyBounded(getPromptColumns(codaSchema.columns), MAX_METADATA_CHARS)}`,
+      `metadata=${stringifyBounded(scraped.metadata, MAX_METADATA_CHARS)}`,
       scraped.structuredData
-        ? `Scraped structured product data:\n${JSON.stringify(scraped.structuredData, null, 2)}`
+        ? `structuredProductData=${stringifyBounded(scraped.structuredData, MAX_STRUCTURED_DATA_CHARS)}`
         : "",
-      "",
-      "Scraped markdown:",
-      scraped.markdown,
+      `markdown=${truncateString(scraped.markdown, markdownBudget)}`,
     ].join("\n"),
   });
 
   return object as Record<string, unknown>;
+}
+
+function getPromptColumns(columns: TargetColumn[]) {
+  return columns.map((column) => ({
+    name: column.name,
+    type: column.type,
+    description: column.description ? truncateString(column.description, MAX_COLUMN_DESCRIPTION_CHARS) : null,
+    multiple: column.allowsMultipleValues,
+    options: getPromptExistingOptions(column.existingOptions),
+  }));
+}
+
+function getPromptExistingOptions(options: string[]): string[] {
+  return options
+    .slice(0, MAX_EXISTING_OPTIONS_IN_PROMPT)
+    .map((option) => truncateString(option, MAX_EXISTING_OPTION_CHARS));
+}
+
+function stringifyBounded(value: unknown, maxChars: number): string {
+  return truncateString(JSON.stringify(value), maxChars);
+}
+
+function truncateString(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+
+  return `${value.slice(0, maxChars)}\n[truncated ${value.length - maxChars} chars]`;
 }
 
 async function saveToCoda(
@@ -714,7 +734,11 @@ function buildColumnDescription(column: TargetColumn): string {
   }
 
   if (column.existingOptions.length > 0) {
-    parts.push(`Existing options: ${column.existingOptions.join(", ")}.`);
+    const optionSuffix =
+      column.existingOptions.length > MAX_EXISTING_OPTIONS_IN_PROMPT
+        ? `, plus ${column.existingOptions.length - MAX_EXISTING_OPTIONS_IN_PROMPT} more`
+        : "";
+    parts.push(`Existing options: ${getPromptExistingOptions(column.existingOptions).join(", ")}${optionSuffix}.`);
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {

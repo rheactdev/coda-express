@@ -208,6 +208,29 @@ The model is hardcoded in code:
 const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2p6";
 ```
 
+### Token Budget Controls
+
+The extraction prompt is intentionally compact:
+
+- JSON blocks are minified instead of pretty-printed.
+- Full Coda column objects are reduced to only name, type, description, multi-value support, and capped existing options.
+- Relation/select options are capped with `MAX_EXISTING_OPTIONS_IN_PROMPT`.
+- Markdown is truncated with `MAX_MARKDOWN_CHARS`.
+- When Firecrawl structured product data is available, markdown is truncated more aggressively with `MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA`.
+- Metadata and structured data are separately bounded.
+
+The current constants live near the top of [server.ts](./server.ts):
+
+```ts
+MAX_MARKDOWN_CHARS
+MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA
+MAX_METADATA_CHARS
+MAX_STRUCTURED_DATA_CHARS
+MAX_COLUMN_DESCRIPTION_CHARS
+MAX_EXISTING_OPTIONS_IN_PROMPT
+MAX_EXISTING_OPTION_CHARS
+```
+
 ## Firecrawl Scraping
 
 Generic sites use Markdown.

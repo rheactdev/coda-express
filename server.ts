@@ -685,6 +685,7 @@ async function extractData(
       "Use exact keys only. If absent, return null.",
       "Prefer structured product data over markdown.",
       "Relations/selects: use existing options when they fit; invent only if none fit.",
+      "For product categories/tags, choose the option describing the whole product, not a small included component.",
       "Be concise. No commentary.",
     ].join("\n"),
     prompt: [
@@ -790,7 +791,7 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCe
       .filter((item): item is CodaScalarValue => item !== undefined);
 
     if (typeof column !== "string" && column?.allowsMultipleValues === false) {
-      const selectedValue = selectMostSpecificValue(values);
+      const selectedValue = selectBestProductLevelValue(values);
       return typeof selectedValue === "string"
         ? normalizeCodaStringValue(selectedValue, columnName)
         : selectedValue;
@@ -899,13 +900,13 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one related item. If multiple options fit, choose the most specific option.`);
+        .describe(`${description} Return exactly one related item. If multiple options fit, choose the best product-level category, not a minor included component.`);
     }
 
     return z
       .union([z.string(), z.array(z.string())])
       .nullable()
-      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Prefer the most specific matching options.`);
+      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Prefer product-level categories over minor included components.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -925,7 +926,7 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one value. If multiple options fit, choose the most specific option.`);
+        .describe(`${description} Return exactly one value. If multiple options fit, choose the best product-level category, not a minor included component.`);
     }
 
     return z
@@ -962,7 +963,7 @@ function buildColumnDescription(column: TargetColumn): string {
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {
-    parts.push("This column accepts only one value; choose the most specific matching option.");
+    parts.push("This column accepts only one value; choose the best product-level match. For kits, bundles, or sets, prefer the set/category label over a single included component.");
   }
 
   return parts.join(" ");
@@ -1097,7 +1098,7 @@ function dedupeStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
-function selectMostSpecificValue(values: CodaScalarValue[]): CodaScalarValue | undefined {
+function selectBestProductLevelValue(values: CodaScalarValue[]): CodaScalarValue | undefined {
   if (values.length === 0) {
     return undefined;
   }
@@ -1108,11 +1109,11 @@ function selectMostSpecificValue(values: CodaScalarValue[]): CodaScalarValue | u
   }
 
   return strings.reduce((best, candidate) =>
-    getSpecificityScore(candidate, strings) > getSpecificityScore(best, strings) ? candidate : best,
+    getProductLevelMatchScore(candidate, strings) > getProductLevelMatchScore(best, strings) ? candidate : best,
   );
 }
 
-function getSpecificityScore(value: string, candidates: string[]): number {
+function getProductLevelMatchScore(value: string, candidates: string[]): number {
   const normalized = normalizeComparableText(value);
   const tokens = normalized.split(" ").filter(Boolean);
   const containsAnotherCandidate = candidates.some((candidate) => {
@@ -1129,8 +1130,55 @@ function getSpecificityScore(value: string, candidates: string[]): number {
     tokens.length * 2 +
     (containsAnotherCandidate ? 4 : 0) -
     (containedByAnotherCandidate ? 4 : 0) -
-    getBroadCategoryPenalty(tokens)
+    getBroadCategoryPenalty(tokens) +
+    getSetCategoryBonus(tokens) -
+    getComponentCategoryPenalty(tokens)
   );
+}
+
+function getSetCategoryBonus(tokens: string[]): number {
+  const setCategoryTerms = new Set([
+    "assortment",
+    "bundle",
+    "collection",
+    "kit",
+    "pack",
+    "set",
+    "stationery",
+  ]);
+
+  return tokens.reduce((bonus, token) => bonus + (setCategoryTerms.has(token) ? 12 : 0), 0);
+}
+
+function getComponentCategoryPenalty(tokens: string[]): number {
+  const componentTerms = new Set([
+    "bookmark",
+    "bookmarks",
+    "button",
+    "buttons",
+    "card",
+    "cards",
+    "clip",
+    "clips",
+    "eraser",
+    "erasers",
+    "journal",
+    "journals",
+    "notebook",
+    "notebooks",
+    "pen",
+    "pencil",
+    "pencils",
+    "pens",
+    "pin",
+    "pins",
+    "refill",
+    "refills",
+    "sticker",
+    "stickers",
+  ]);
+
+  return tokens.reduce((penalty, token) => penalty + (componentTerms.has(token) ? 10 : 0), 0);
 }
 
 function getBroadCategoryPenalty(tokens: string[]): number {

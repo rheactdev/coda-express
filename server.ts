@@ -389,23 +389,84 @@ async function saveToCoda(
   extracted: Record<string, unknown>,
 ): Promise<{ id?: string; requestId?: string }> {
   const cells = Object.entries(extracted)
-    .filter(([, value]) => value !== undefined)
     .map(([column, value]) => ({
       column,
-      value,
-    }));
+      value: toCodaCellValue(value),
+    }))
+    .filter((cell): cell is { column: string; value: CodaCellValue } => cell.value !== undefined);
 
   if (cells.length === 0) {
     throw new Error("No extracted cells to save.");
   }
 
+  const body = {
+    rows: [{ cells }],
+    useColumnNames: true,
+  };
+
   return codaFetch(`/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(tableId)}/rows`, codaToken, {
     method: "POST",
-    body: JSON.stringify({
-      rows: [{ cells }],
-      useColumnNames: true,
-    }),
+    body: JSON.stringify(body),
+    logContext: {
+      codaRowPayload: body,
+    },
   });
+}
+
+type CodaScalarValue = boolean | number | string;
+type CodaCellValue = CodaScalarValue | CodaScalarValue[] | null;
+
+function toCodaCellValue(value: unknown): CodaCellValue | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map(toCodaScalarValue)
+      .filter((item): item is CodaScalarValue => item !== undefined);
+  }
+
+  const scalar = toCodaScalarValue(value);
+  return scalar ?? JSON.stringify(value);
+}
+
+function toCodaScalarValue(value: unknown): CodaScalarValue | undefined {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const candidate =
+      record.name ??
+      record.display ??
+      record.value ??
+      record.label ??
+      record.url ??
+      record.href ??
+      record.text;
+
+    if (typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean") {
+      return candidate;
+    }
+
+    return JSON.stringify(value);
+  }
+
+  return String(value);
 }
 
 function buildExtractionSchema(columns: TargetColumn[]) {
@@ -472,14 +533,15 @@ function buildColumnDescription(column: TargetColumn): string {
 async function codaFetch<T>(
   path: string,
   codaToken: string,
-  init: RequestInit = {},
+  init: CodaFetchInit = {},
 ): Promise<T> {
+  const { logContext, ...fetchInit } = init;
   const response = await fetch(`${CODA_API_BASE}${path}`, {
-    ...init,
+    ...fetchInit,
     headers: {
       Authorization: `Bearer ${codaToken}`,
       "Content-Type": "application/json",
-      ...(init.headers ?? {}),
+      ...(fetchInit.headers ?? {}),
     },
   });
 
@@ -487,13 +549,18 @@ async function codaFetch<T>(
 
   if (!response.ok) {
     const responseDetails = getCodaErrorDetails(responseText);
+    const contextDetails = logContext ? ` Context: ${formatErrorForLog(logContext)}` : "";
     throw new Error(
-      `Coda API request failed with status ${response.status}${responseDetails ? `: ${responseDetails}` : ""}.`,
+      `Coda API request failed with status ${response.status}${responseDetails ? `: ${responseDetails}` : ""}.${contextDetails}`,
     );
   }
 
   return JSON.parse(responseText) as T;
 }
+
+type CodaFetchInit = RequestInit & {
+  logContext?: unknown;
+};
 
 function isWritableColumn(column: CodaColumn): boolean {
   if (column.calculated) {

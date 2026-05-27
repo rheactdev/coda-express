@@ -106,30 +106,33 @@ app.post(
   WORKFLOW_PATH,
   serve<WorkflowSaveBookmarkPayload>(async (context) => {
     const payload = context.requestPayload;
-    const parsed = parseSaveBookmarkPayload(payload, payload.codaToken);
 
-    if (!parsed.ok) {
-      throw new Error("Invalid workflow payload.");
-    }
+    const input = await context.run("validate-payload", async () => {
+      const parsed = parseSaveBookmarkPayload(payload, payload.codaToken);
 
-    const input = parsed.data;
+      if (!parsed.ok) {
+        throw new Error("Invalid workflow payload.");
+      }
 
-    const scraped = await runWorkflowStep("scrape", () =>
-      context.run("scrape", async () => scrapeUrl(input.url)),
+      return parsed.data;
+    });
+
+    const scraped = await context.run("scrape", () =>
+      runWorkflowStep("scrape", () => scrapeUrl(input.url)),
     );
 
-    const codaSchema = await runWorkflowStep("fetch-coda-schema", () =>
-      context.run("fetch-coda-schema", async () =>
+    const codaSchema = await context.run("fetch-coda-schema", () =>
+      runWorkflowStep("fetch-coda-schema", () =>
         fetchCodaSchema(input.docId, input.tableId, input.codaToken),
       ),
     );
 
-    const extracted = await runWorkflowStep("extract-data", () =>
-      context.run("extract-data", async () => extractData(scraped, codaSchema)),
+    const extracted = await context.run("extract-data", () =>
+      runWorkflowStep("extract-data", () => extractData(scraped, codaSchema)),
     );
 
-    await runWorkflowStep("save-to-coda", () =>
-      context.run("save-to-coda", async () =>
+    await context.run("save-to-coda", () =>
+      runWorkflowStep("save-to-coda", () =>
         saveToCoda(input.docId, input.tableId, input.codaToken, extracted),
       ),
     );

@@ -55,6 +55,7 @@ type TargetColumn = {
 type ScrapeResult = {
   markdown: string;
   metadata: Record<string, unknown>;
+  structuredData?: Record<string, unknown>;
 };
 
 const CODA_API_BASE = "https://coda.io/apis/v1";
@@ -247,8 +248,17 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
 }
 
 async function scrapeUrl(url: string): Promise<ScrapeResult> {
+  const structuredScrapeSchema = getStructuredScrapeSchema(url);
   const scrapeOptions = {
-    formats: ["markdown"],
+    formats: structuredScrapeSchema
+      ? [
+          "markdown",
+          {
+            type: "json",
+            schema: z.toJSONSchema(structuredScrapeSchema),
+          },
+        ]
+      : ["markdown"],
     onlyMainContent: true,
   };
   const client = firecrawl as unknown as {
@@ -275,8 +285,72 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
   }
 
   const metadata = getFirecrawlMetadata(response);
+  const structuredData = getFirecrawlJson(response);
 
-  return { markdown, metadata };
+  return { markdown, metadata, structuredData };
+}
+
+const AmazonProductSchema = z.object({
+  title: z.string().nullable(),
+  price: z.string().nullable(),
+  currency: z.string().nullable(),
+  availability: z.string().nullable(),
+  rating: z.string().nullable(),
+  reviewCount: z.string().nullable(),
+  brand: z.string().nullable(),
+  asin: z.string().nullable(),
+  modelNumber: z.string().nullable(),
+  itemModelNumber: z.string().nullable(),
+  productImage: z.string().nullable(),
+  imageUrls: z.array(z.string()).nullable(),
+  features: z.array(z.string()).nullable(),
+});
+
+const EtsyListingSchema = z.object({
+  title: z.string().nullable(),
+  price: z.string().nullable(),
+  currency: z.string().nullable(),
+  shopName: z.string().nullable(),
+  shopUrl: z.string().nullable(),
+  rating: z.string().nullable(),
+  reviewCount: z.string().nullable(),
+  availability: z.string().nullable(),
+  listingId: z.string().nullable(),
+  productImage: z.string().nullable(),
+  imageUrls: z.array(z.string()).nullable(),
+  description: z.string().nullable(),
+  variations: z.array(z.string()).nullable(),
+  materials: z.array(z.string()).nullable(),
+});
+
+function getStructuredScrapeSchema(url: string): typeof AmazonProductSchema | typeof EtsyListingSchema | undefined {
+  if (isAmazonUrl(url)) {
+    return AmazonProductSchema;
+  }
+
+  if (isEtsyUrl(url)) {
+    return EtsyListingSchema;
+  }
+
+  return undefined;
+}
+
+function isAmazonUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.replace(/^www\./i, "").toLowerCase();
+    return hostname === "amazon.com" || hostname.endsWith(".amazon.com");
+  } catch {
+    return false;
+  }
+}
+
+function isEtsyUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.replace(/^www\./i, "").toLowerCase();
+    return hostname === "etsy.com" || hostname.endsWith(".etsy.com");
+  } catch {
+    return false;
+  }
 }
 
 async function fetchCodaSchema(
@@ -373,6 +447,10 @@ async function extractData(
       "",
       "Scraped metadata:",
       JSON.stringify(scraped.metadata, null, 2),
+      "",
+      scraped.structuredData
+        ? `Scraped structured product data:\n${JSON.stringify(scraped.structuredData, null, 2)}`
+        : "",
       "",
       "Scraped markdown:",
       scraped.markdown,
@@ -707,6 +785,22 @@ function getFirecrawlMetadata(response: unknown): Record<string, unknown> {
   const metadata = asRecord(topLevel?.metadata) ?? asRecord(data?.metadata);
 
   return metadata ?? {};
+}
+
+function getFirecrawlJson(response: unknown): Record<string, unknown> | undefined {
+  const data = getNestedRecord(response, "data");
+  const topLevel = asRecord(response);
+  const json = topLevel?.json ?? data?.json;
+
+  if (typeof json === "string") {
+    try {
+      return asRecord(JSON.parse(json));
+    } catch {
+      return undefined;
+    }
+  }
+
+  return asRecord(json);
 }
 
 function getCodaErrorDetails(responseText: string): string {

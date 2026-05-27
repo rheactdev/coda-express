@@ -1,9 +1,12 @@
 import express, { type Request, type Response } from "express";
+import { config } from "dotenv";
 import { Client } from "@upstash/workflow";
 import { serve } from "@upstash/workflow/express";
 import Firecrawl from "@mendable/firecrawl-js";
 import { generateObject } from "ai";
 import { z, type ZodTypeAny } from "zod";
+
+config();
 
 type SaveBookmarkPayload = {
   url: string;

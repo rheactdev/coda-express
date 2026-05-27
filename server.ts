@@ -1,4 +1,5 @@
-import express, { type Request, type Response } from "express";
+import crypto from "crypto";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { config } from "dotenv";
 import { Client } from "@upstash/workflow";
 import { serve } from "@upstash/workflow/express";
@@ -66,6 +67,7 @@ type ScrapeResult = {
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
 const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2p6";
+const API_KEY = requireEnv("API_KEY");
 
 const app = express();
 
@@ -89,7 +91,7 @@ Object.defineProperty(fireworksExtractionModel, "supportsStructuredOutputs", {
   configurable: true,
 });
 
-app.post("/api/save-bookmark", async (req: Request, res: Response) => {
+app.post("/api/save-bookmark", requireApiKey, async (req: Request, res: Response) => {
   const payload = parseSaveBookmarkPayload(req.body, getBearerToken(req));
 
   if (!payload.ok) {
@@ -175,6 +177,27 @@ function requireEnv(name: string): string {
 
 function requireSecretEnv(name: string): string {
   return requireEnv(name).replace(/^Bearer\s+/i, "");
+}
+
+function requireApiKey(req: Request, res: Response, next: NextFunction): void {
+  const apiKey = req.header("x-api-key");
+
+  if (!apiKey || !constantTimeEquals(apiKey, API_KEY)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  next();
+}
+
+function constantTimeEquals(actual: string, expected: string): boolean {
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+
+  return (
+    actualBuffer.length === expectedBuffer.length &&
+    crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  );
 }
 
 function getWorkflowUrl(req: Request): string {

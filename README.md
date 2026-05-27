@@ -2,12 +2,12 @@
 
 Express backend for a web-clipping workflow that saves arbitrary product/page data into user-selected Coda tables.
 
-The core trick is that the Coda table schema is not known ahead of time. The extension or Pack sends a URL plus a Coda doc/table target, and the backend fetches that table's columns at runtime, builds a matching Zod schema dynamically, asks Fireworks AI to extract structured data from Firecrawl output, then writes the row to Coda.
+The core trick is that the Coda table schema is not known ahead of time. The browser extension sends a URL plus a Coda doc/table target, and the backend fetches that table's columns at runtime, builds a matching Zod schema dynamically, asks Fireworks AI to extract structured data from Firecrawl output, then writes the row to Coda.
 
 ## Architecture
 
 ```text
-Browser extension / Coda Pack
+Browser extension
   POST /api/save-bookmark
     { url, docId, tableId }
     Authorization: Bearer <user Coda token>
@@ -40,7 +40,7 @@ Upstash Workflow worker
 
 ### `POST /api/save-bookmark`
 
-Publisher endpoint used by the browser extension or Coda Pack.
+Publisher endpoint used by the browser extension.
 
 Headers:
 
@@ -60,7 +60,7 @@ Body:
 }
 ```
 
-Compatibility fallback: `codaToken` may still be provided in the JSON body, but the preferred path is the `Authorization` header so a Coda Pack can store the token securely.
+Compatibility fallback: `codaToken` may still be provided in the JSON body, but the preferred path is the `Authorization` header.
 
 Response:
 
@@ -73,7 +73,7 @@ Response:
 
 ### `POST /api/workflow/save-bookmark`
 
-Upstash Workflow worker endpoint. Do not call this directly from the client or Pack.
+Upstash Workflow worker endpoint. Do not call this directly from the client.
 
 ## Environment Variables
 
@@ -150,17 +150,19 @@ Required Vercel env vars:
 
 After changing backend code, redeploy before testing new workflow runs. Existing Upstash workflow runs can still reflect old deployed code.
 
-## Coda Pack Contract
+## Browser Extension
 
-The matching Coda Pack should:
+The matching browser extension lives here:
 
-- Use Coda Pack auth to connect a Coda account in Pack settings.
-- Store the user's Coda token securely.
-- Send that token as `Authorization: Bearer ...`.
+[rheactdev/coda-express-extension](https://github.com/rheactdev/coda-express-extension)
+
+The extension should:
+
+- Let the user configure this backend's deployed base URL.
+- Let the user configure or retrieve a Coda API token securely.
+- Send the Coda token as `Authorization: Bearer ...`.
 - Send the backend shared secret as `x-api-key`.
 - Send only `url`, `docId`, and `tableId` in the JSON body.
-
-The prompt for building that Pack lives at [agents/coda.md](./agents/coda.md).
 
 ## Dynamic Coda Schema Handling
 

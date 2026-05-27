@@ -77,8 +77,10 @@ const firecrawl = new Firecrawl({
 const fireworks = createFireworks({
   apiKey: requireSecretEnv("FIREWORKS_API_KEY"),
 });
-const fireworksExtractionModel = Object.assign(fireworks(FIREWORKS_MODEL), {
-  supportsStructuredOutputs: true,
+const fireworksExtractionModel = fireworks(FIREWORKS_MODEL);
+Object.defineProperty(fireworksExtractionModel, "supportsStructuredOutputs", {
+  value: true,
+  configurable: true,
 });
 
 app.post("/api/save-bookmark", async (req: Request, res: Response) => {
@@ -421,7 +423,10 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
   const description = buildColumnDescription(column);
 
   if (type.includes("relation") || column.relationTableId) {
-    return z.string().nullable().describe(description);
+    return z
+      .union([z.string(), z.array(z.string())])
+      .nullable()
+      .describe(`${description} Return a string for one related item or an array of strings for multiple related items.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -437,7 +442,10 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
   }
 
   if (type.includes("select") || type.includes("lookup") || type.includes("person")) {
-    return z.string().nullable().describe(description);
+    return z
+      .union([z.string(), z.array(z.string())])
+      .nullable()
+      .describe(`${description} Return a string for one value or an array of strings for multiple values.`);
   }
 
   if (type.includes("image") || type.includes("url") || type.includes("link")) {

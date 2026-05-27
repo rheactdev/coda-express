@@ -77,6 +77,9 @@ const firecrawl = new Firecrawl({
 const fireworks = createFireworks({
   apiKey: requireSecretEnv("FIREWORKS_API_KEY"),
 });
+const fireworksExtractionModel = Object.assign(fireworks(FIREWORKS_MODEL), {
+  supportsStructuredOutputs: true,
+});
 
 app.post("/api/save-bookmark", async (req: Request, res: Response) => {
   const payload = parseSaveBookmarkPayload(req.body, getBearerToken(req));
@@ -346,8 +349,9 @@ async function extractData(
     .join("\n");
 
   const { object } = await generateObject({
-    model: fireworks(FIREWORKS_MODEL),
+    model: fireworksExtractionModel,
     schema,
+    maxRetries: 0,
     system: [
       "You extract structured data for a Coda table from scraped webpage markdown.",
       "Never hallucinate. If a value for a column is not present in the markdown or metadata, return null.",

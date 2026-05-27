@@ -70,7 +70,7 @@ const workflowClient = new Client({
 });
 
 const firecrawl = new Firecrawl({
-  apiKey: requireEnv("FIRECRAWL_API_KEY"),
+  apiKey: requireSecretEnv("FIRECRAWL_API_KEY"),
 });
 
 app.post("/api/save-bookmark", async (req: Request, res: Response) => {
@@ -151,10 +151,14 @@ export default app;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
-  if (!value) {
+  if (!value?.trim()) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
-  return value;
+  return value.trim();
+}
+
+function requireSecretEnv(name: string): string {
+  return requireEnv(name).replace(/^Bearer\s+/i, "");
 }
 
 function getWorkflowUrl(req: Request): string {

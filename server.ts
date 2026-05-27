@@ -250,14 +250,16 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
 async function scrapeUrl(url: string): Promise<ScrapeResult> {
   const structuredScrapeSchema = getStructuredScrapeSchema(url);
   const scrapeOptions = {
-    formats: structuredScrapeSchema ? ["markdown", "json"] : ["markdown"],
-    ...(structuredScrapeSchema
-      ? {
-          jsonOptions: {
+    formats: structuredScrapeSchema
+      ? [
+          "markdown",
+          {
+            type: "json",
+            prompt: "Extract structured product listing data from this page.",
             schema: structuredScrapeSchema,
           },
-        }
-      : {}),
+        ]
+      : ["markdown"],
     onlyMainContent: true,
   };
   const client = firecrawl as unknown as {

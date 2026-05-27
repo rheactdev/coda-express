@@ -688,7 +688,9 @@ async function extractData(
       "If no existing option precisely describes the product, create a concise new product-level tag.",
       "Avoid near-duplicate tags. If an existing compound option covers the product subtype, use it.",
       "Do not force vague adjacent tags like Journaling for a Planner.",
-      "For product categories/tags, choose the option describing the whole product, not a small included component.",
+      "For product categories/tags, reason from the whole product description.",
+      "If a set contains one kind of item, use that item type. If it contains multiple different item types, use the broader set/category tag when available.",
+      "For single-select fields where multiple options fit, choose the one most useful for a user browsing or filtering the table later.",
       "Be concise. No commentary.",
     ].join("\n"),
     prompt: [
@@ -742,10 +744,11 @@ async function saveToCoda(
   columns: TargetColumn[],
 ): Promise<{ id?: string; requestId?: string }> {
   const columnMap = new Map(columns.map((column) => [column.name, column]));
+  const productContext = getProductContext(extracted);
   const cells = Object.entries(extracted)
     .map(([column, value]) => ({
       column,
-      value: toCodaCellValue(value, columnMap.get(column) ?? column),
+      value: toCodaCellValue(value, columnMap.get(column) ?? column, productContext),
     }))
     .filter(
       (cell): cell is { column: string; value: Exclude<CodaCellValue, null> } =>
@@ -773,7 +776,7 @@ async function saveToCoda(
 type CodaScalarValue = boolean | number | string;
 type CodaCellValue = CodaScalarValue | CodaScalarValue[] | null;
 
-function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCellValue | undefined {
+function toCodaCellValue(value: unknown, column?: TargetColumn | string, productContext = ""): CodaCellValue | undefined {
   const columnName = typeof column === "string" ? column : column?.name;
 
   if (value === undefined) {
@@ -794,7 +797,7 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCe
       .filter((item): item is CodaScalarValue => item !== undefined);
 
     if (typeof column !== "string" && column?.allowsMultipleValues === false) {
-      const selectedValue = selectBestProductLevelValue(values);
+      const selectedValue = selectBestProductLevelValue(values, productContext);
       return typeof selectedValue === "string"
         ? normalizeExtractedStringValue(selectedValue, column)
         : selectedValue;
@@ -805,6 +808,24 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCe
 
   const scalar = toCodaScalarValue(value);
   return typeof scalar === "string" ? normalizeExtractedStringValue(scalar, column) : scalar ?? JSON.stringify(value);
+}
+
+function getProductContext(extracted: Record<string, unknown>): string {
+  const contextParts: string[] = [];
+
+  for (const [key, value] of Object.entries(extracted)) {
+    if (!isProductContextColumn(key) || typeof value !== "string") {
+      continue;
+    }
+
+    contextParts.push(value);
+  }
+
+  return normalizeComparableText(contextParts.join(" "));
+}
+
+function isProductContextColumn(columnName: string): boolean {
+  return /\b(name|title|description|notes|summary|product)\b/i.test(columnName);
 }
 
 function toCodaScalarValue(value: unknown): CodaScalarValue | undefined {
@@ -936,13 +957,13 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one related item. Use an existing option if it clearly matches or covers the subtype; e.g. use "Enamel & Acrylic Pins" for acrylic pins. Otherwise create a concise new product-level tag. Choose the best product-level category, not a minor included component.`);
+        .describe(`${description} Return exactly one related item. Use an existing option if it clearly matches or covers the subtype. Otherwise create a concise new product-level tag. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
     }
 
     return z
       .union([z.string(), z.array(z.string())])
       .nullable()
-      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Use existing options when they clearly match or cover the subtype; e.g. use "Enamel & Acrylic Pins" for acrylic pins. Otherwise create concise new product-level tags. Prefer product-level categories over minor included components.`);
+      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Use existing options when they clearly match or cover the subtype. Otherwise create concise new product-level tags. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -962,7 +983,7 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one value. If multiple options fit, choose the best product-level category, not a minor included component.`);
+        .describe(`${description} Return exactly one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category value when available.`);
     }
 
     return z
@@ -999,7 +1020,7 @@ function buildColumnDescription(column: TargetColumn): string {
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {
-    parts.push("This column accepts only one value. Choose the best product-level match. Use an existing option if it clearly matches or covers the subtype; otherwise create a concise new tag. For kits, bundles, or sets, prefer the set/category label over a single included component.");
+    parts.push("This column accepts only one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. Use an existing option if it clearly matches or covers the subtype; otherwise create a concise new tag. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.");
   }
 
   return parts.join(" ");
@@ -1134,7 +1155,7 @@ function dedupeStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
-function selectBestProductLevelValue(values: CodaScalarValue[]): CodaScalarValue | undefined {
+function selectBestProductLevelValue(values: CodaScalarValue[], productContext: string): CodaScalarValue | undefined {
   if (values.length === 0) {
     return undefined;
   }
@@ -1145,11 +1166,11 @@ function selectBestProductLevelValue(values: CodaScalarValue[]): CodaScalarValue
   }
 
   return strings.reduce((best, candidate) =>
-    getProductLevelMatchScore(candidate, strings) > getProductLevelMatchScore(best, strings) ? candidate : best,
+    getProductLevelMatchScore(candidate, strings, productContext) > getProductLevelMatchScore(best, strings, productContext) ? candidate : best,
   );
 }
 
-function getProductLevelMatchScore(value: string, candidates: string[]): number {
+function getProductLevelMatchScore(value: string, candidates: string[], productContext: string): number {
   const normalized = normalizeComparableText(value);
   const tokens = normalized.split(" ").filter(Boolean);
   const containsAnotherCandidate = candidates.some((candidate) => {
@@ -1167,54 +1188,13 @@ function getProductLevelMatchScore(value: string, candidates: string[]): number 
     (containsAnotherCandidate ? 4 : 0) -
     (containedByAnotherCandidate ? 4 : 0) -
     getBroadCategoryPenalty(tokens) +
-    getSetCategoryBonus(tokens) -
-    getComponentCategoryPenalty(tokens)
+    getProductContextTokenBonus(tokens, productContext)
   );
 }
 
-function getSetCategoryBonus(tokens: string[]): number {
-  const setCategoryTerms = new Set([
-    "assortment",
-    "bundle",
-    "collection",
-    "kit",
-    "pack",
-    "set",
-    "stationery",
-  ]);
-
-  return tokens.reduce((bonus, token) => bonus + (setCategoryTerms.has(token) ? 12 : 0), 0);
-}
-
-function getComponentCategoryPenalty(tokens: string[]): number {
-  const componentTerms = new Set([
-    "bookmark",
-    "bookmarks",
-    "button",
-    "buttons",
-    "card",
-    "cards",
-    "clip",
-    "clips",
-    "eraser",
-    "erasers",
-    "journal",
-    "journals",
-    "notebook",
-    "notebooks",
-    "pen",
-    "pencil",
-    "pencils",
-    "pens",
-    "pin",
-    "pins",
-    "refill",
-    "refills",
-    "sticker",
-    "stickers",
-  ]);
-
-  return tokens.reduce((penalty, token) => penalty + (componentTerms.has(token) ? 10 : 0), 0);
+function getProductContextTokenBonus(tokens: string[], productContext: string): number {
+  const contextTokens = new Set(productContext.split(" ").filter(Boolean));
+  return tokens.reduce((bonus, token) => bonus + (contextTokens.has(token) ? 14 : 0), 0);
 }
 
 function getBroadCategoryPenalty(tokens: string[]): number {

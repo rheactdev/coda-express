@@ -59,7 +59,7 @@ type ScrapeResult = {
 
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
-const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2-instruct";
+const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2p6";
 
 const app = express();
 

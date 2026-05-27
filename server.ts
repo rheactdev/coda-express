@@ -684,7 +684,10 @@ async function extractData(
       "Extract JSON for a Coda table from scraped page data.",
       "Use exact keys only. If absent, return null.",
       "Prefer structured product data over markdown.",
-      "Relations/selects: use existing options when they fit; invent only if none fit.",
+      "Relations/selects: use an existing option only for a clear semantic match.",
+      "If no existing option precisely describes the product, create a concise new product-level tag.",
+      "Avoid near-duplicate tags. If an existing compound option covers the product subtype, use it.",
+      "Do not force vague adjacent tags like Journaling for a Planner.",
       "For product categories/tags, choose the option describing the whole product, not a small included component.",
       "Be concise. No commentary.",
     ].join("\n"),
@@ -778,7 +781,7 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCe
   }
 
   if (typeof value === "string") {
-    return normalizeCodaStringValue(value, columnName);
+    return normalizeExtractedStringValue(value, column);
   }
 
   if (value === null || typeof value === "number" || typeof value === "boolean") {
@@ -793,15 +796,15 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCe
     if (typeof column !== "string" && column?.allowsMultipleValues === false) {
       const selectedValue = selectBestProductLevelValue(values);
       return typeof selectedValue === "string"
-        ? normalizeCodaStringValue(selectedValue, columnName)
+        ? normalizeExtractedStringValue(selectedValue, column)
         : selectedValue;
     }
 
-    return values;
+    return values.map((item) => (typeof item === "string" ? normalizeExtractedStringValue(item, column) : item));
   }
 
   const scalar = toCodaScalarValue(value);
-  return scalar ?? JSON.stringify(value);
+  return typeof scalar === "string" ? normalizeExtractedStringValue(scalar, column) : scalar ?? JSON.stringify(value);
 }
 
 function toCodaScalarValue(value: unknown): CodaScalarValue | undefined {
@@ -844,6 +847,39 @@ function normalizeCodaStringValue(value: string, columnName?: string): string {
   }
 
   return value;
+}
+
+function normalizeExtractedStringValue(value: string, column?: TargetColumn | string): string {
+  const columnName = typeof column === "string" ? column : column?.name;
+  const normalizedValue = normalizeCodaStringValue(value, columnName);
+
+  if (!column || typeof column === "string" || !isMultiValueType(column)) {
+    return normalizedValue;
+  }
+
+  return findCoveringExistingOption(normalizedValue, column.existingOptions) ?? normalizedValue;
+}
+
+function findCoveringExistingOption(value: string, existingOptions: string[]): string | undefined {
+  const normalizedValue = normalizeComparableText(value);
+  if (!normalizedValue) {
+    return undefined;
+  }
+
+  const exactMatch = existingOptions.find((option) => normalizeComparableText(option) === normalizedValue);
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  return existingOptions.find((option) => {
+    const normalizedOption = normalizeComparableText(option);
+    return normalizedOption !== normalizedValue && containsAllTokens(normalizedOption, normalizedValue);
+  });
+}
+
+function containsAllTokens(container: string, contained: string): boolean {
+  const containerTokens = new Set(container.split(" ").filter(Boolean));
+  return contained.split(" ").filter(Boolean).every((token) => containerTokens.has(token));
 }
 
 function isUrlColumnName(columnName: string): boolean {
@@ -900,13 +936,13 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one related item. If multiple options fit, choose the best product-level category, not a minor included component.`);
+        .describe(`${description} Return exactly one related item. Use an existing option if it clearly matches or covers the subtype; e.g. use "Enamel & Acrylic Pins" for acrylic pins. Otherwise create a concise new product-level tag. Choose the best product-level category, not a minor included component.`);
     }
 
     return z
       .union([z.string(), z.array(z.string())])
       .nullable()
-      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Prefer product-level categories over minor included components.`);
+      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Use existing options when they clearly match or cover the subtype; e.g. use "Enamel & Acrylic Pins" for acrylic pins. Otherwise create concise new product-level tags. Prefer product-level categories over minor included components.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -963,7 +999,7 @@ function buildColumnDescription(column: TargetColumn): string {
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {
-    parts.push("This column accepts only one value; choose the best product-level match. For kits, bundles, or sets, prefer the set/category label over a single included component.");
+    parts.push("This column accepts only one value. Choose the best product-level match. Use an existing option if it clearly matches or covers the subtype; otherwise create a concise new tag. For kits, bundles, or sets, prefer the set/category label over a single included component.");
   }
 
   return parts.join(" ");

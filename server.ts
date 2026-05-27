@@ -442,8 +442,7 @@ function getShopifyProductJsonUrl(value: string): string | undefined {
 
 function normalizeShopifyProduct(product: Record<string, unknown>): ShopifyProductData {
   const variants = asArrayOfRecords(product.variants);
-  const images = asArrayOfRecords(product.images);
-  const featuredImage = asRecord(product.featured_image);
+  const imageUrls = getShopifyImageUrls(product);
   const firstVariant = variants[0];
   const selectedVariant = variants.find((variant) => variant.available === true) ?? firstVariant;
   const tags = Array.isArray(product.tags)
@@ -463,8 +462,8 @@ function normalizeShopifyProduct(product: Record<string, unknown>): ShopifyProdu
     currency: asString(product.currency) ?? null,
     availability: selectedVariant?.available === true ? "in stock" : selectedVariant?.available === false ? "out of stock" : null,
     sku: asString(selectedVariant?.sku) ?? null,
-    productImage: getShopifyImageUrl(featuredImage) ?? getShopifyImageUrl(images[0]) ?? null,
-    imageUrls: dedupeStrings(images.map(getShopifyImageUrl).filter((image): image is string => Boolean(image))),
+    productImage: imageUrls[0] ?? null,
+    imageUrls,
     variants: variants.map((variant) => ({
       title: asString(variant.title) ?? null,
       sku: asString(variant.sku) ?? null,
@@ -509,8 +508,71 @@ function toShopifyPrice(value: unknown): number | null {
   return null;
 }
 
-function getShopifyImageUrl(image: Record<string, unknown> | undefined): string | undefined {
-  return asString(image?.src) ?? asString(image?.url);
+function getShopifyImageUrls(product: Record<string, unknown>): string[] {
+  const variants = asArrayOfRecords(product.variants);
+  const imageCandidates = [
+    product.featured_image,
+    asRecord(product.featured_media)?.preview_image,
+    ...asUnknownArray(product.images),
+    ...asUnknownArray(product.media),
+    ...variants.map((variant) => variant.featured_image ?? variant.image),
+  ];
+
+  return dedupeStrings(
+    imageCandidates
+      .flatMap(extractShopifyImageUrls)
+      .map(normalizeShopifyImageUrl)
+      .filter((url): url is string => Boolean(url)),
+  );
+}
+
+function extractShopifyImageUrls(value: unknown): string[] {
+  if (!value) {
+    return [];
+  }
+
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap(extractShopifyImageUrls);
+  }
+
+  const record = asRecord(value);
+  if (!record) {
+    return [];
+  }
+
+  return [
+    record.src,
+    record.url,
+    record.preview_image,
+    record.featured_image,
+    record.image,
+    record.original_src,
+  ].flatMap(extractShopifyImageUrls);
+}
+
+function asUnknownArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeShopifyImageUrl(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (trimmed.startsWith("//")) {
+    return `https:${trimmed}`;
+  }
+
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+    return trimmed;
+  }
+
+  return undefined;
 }
 
 function stripHtml(value: string): string {

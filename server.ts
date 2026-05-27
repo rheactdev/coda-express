@@ -283,6 +283,19 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
 }
 
 async function scrapeUrl(url: string): Promise<ScrapeResult> {
+  const shopifyProduct = await fetchShopifyProduct(url);
+
+  if (shopifyProduct) {
+    return {
+      markdown: shopifyProductToMarkdown(shopifyProduct),
+      metadata: {
+        source: "shopify-product-json",
+        url,
+      },
+      structuredData: shopifyProduct,
+    };
+  }
+
   const structuredScrapeSchema = getStructuredScrapeSchema(url);
   const scrapeOptions = {
     formats: structuredScrapeSchema
@@ -358,6 +371,151 @@ const EtsyListingSchema = z.object({
   variations: z.array(z.string()).nullable(),
   materials: z.array(z.string()).nullable(),
 });
+
+type ShopifyProductData = {
+  title: string | null;
+  vendor: string | null;
+  productType: string | null;
+  handle: string | null;
+  description: string | null;
+  price: number | null;
+  compareAtPrice: number | null;
+  currency: string | null;
+  availability: string | null;
+  sku: string | null;
+  productImage: string | null;
+  imageUrls: string[];
+  variants: Array<{
+    title: string | null;
+    sku: string | null;
+    price: number | null;
+    compareAtPrice: number | null;
+    available: boolean | null;
+  }>;
+  tags: string[];
+};
+
+async function fetchShopifyProduct(url: string): Promise<ShopifyProductData | undefined> {
+  const productJsonUrl = getShopifyProductJsonUrl(url);
+  if (!productJsonUrl) {
+    return undefined;
+  }
+
+  try {
+    const response = await fetch(productJsonUrl, {
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      return undefined;
+    }
+
+    const product = asRecord(await response.json());
+    if (!product?.title) {
+      return undefined;
+    }
+
+    return normalizeShopifyProduct(product);
+  } catch {
+    return undefined;
+  }
+}
+
+function getShopifyProductJsonUrl(value: string): string | undefined {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(value);
+  } catch {
+    return undefined;
+  }
+
+  const match = parsedUrl.pathname.match(/^(.*\/products\/[^/?#]+)(?:\/)?$/);
+  if (!match) {
+    return undefined;
+  }
+
+  return `${parsedUrl.origin}${match[1]}.js`;
+}
+
+function normalizeShopifyProduct(product: Record<string, unknown>): ShopifyProductData {
+  const variants = asArrayOfRecords(product.variants);
+  const images = asArrayOfRecords(product.images);
+  const featuredImage = asRecord(product.featured_image);
+  const firstVariant = variants[0];
+  const selectedVariant = variants.find((variant) => variant.available === true) ?? firstVariant;
+  const tags = Array.isArray(product.tags)
+    ? product.tags.filter((tag): tag is string => typeof tag === "string")
+    : typeof product.tags === "string"
+      ? product.tags.split(",").map((tag) => tag.trim()).filter(Boolean)
+      : [];
+
+  return {
+    title: asString(product.title) ?? null,
+    vendor: asString(product.vendor) ?? null,
+    productType: asString(product.type) ?? null,
+    handle: asString(product.handle) ?? null,
+    description: stripHtml(asString(product.description) ?? asString(product.content) ?? "") || null,
+    price: toShopifyPrice(selectedVariant?.price ?? product.price),
+    compareAtPrice: toShopifyPrice(selectedVariant?.compare_at_price ?? product.compare_at_price),
+    currency: asString(product.currency) ?? null,
+    availability: selectedVariant?.available === true ? "in stock" : selectedVariant?.available === false ? "out of stock" : null,
+    sku: asString(selectedVariant?.sku) ?? null,
+    productImage: getShopifyImageUrl(featuredImage) ?? getShopifyImageUrl(images[0]) ?? null,
+    imageUrls: dedupeStrings(images.map(getShopifyImageUrl).filter((image): image is string => Boolean(image))),
+    variants: variants.map((variant) => ({
+      title: asString(variant.title) ?? null,
+      sku: asString(variant.sku) ?? null,
+      price: toShopifyPrice(variant.price),
+      compareAtPrice: toShopifyPrice(variant.compare_at_price),
+      available: typeof variant.available === "boolean" ? variant.available : null,
+    })),
+    tags,
+  };
+}
+
+function shopifyProductToMarkdown(product: ShopifyProductData): string {
+  return [
+    `Title: ${product.title ?? ""}`,
+    `Vendor: ${product.vendor ?? ""}`,
+    `Product type: ${product.productType ?? ""}`,
+    `Price: ${product.price ?? ""}`,
+    `Compare at price: ${product.compareAtPrice ?? ""}`,
+    `Availability: ${product.availability ?? ""}`,
+    `SKU: ${product.sku ?? ""}`,
+    `Image: ${product.productImage ?? ""}`,
+    `Tags: ${product.tags.join(", ")}`,
+    "",
+    product.description ?? "",
+  ].join("\n");
+}
+
+function asArrayOfRecords(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.map(asRecord).filter((record): record is Record<string, unknown> => Boolean(record)) : [];
+}
+
+function toShopifyPrice(value: unknown): number | null {
+  if (typeof value === "number") {
+    return value > 999 ? value / 100 : value;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? (numericValue > 999 ? numericValue / 100 : numericValue) : null;
+  }
+
+  return null;
+}
+
+function getShopifyImageUrl(image: Record<string, unknown> | undefined): string | undefined {
+  return asString(image?.src) ?? asString(image?.url);
+}
+
+function stripHtml(value: string): string {
+  return value.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
 
 function getStructuredScrapeSchema(url: string): typeof AmazonProductSchema | typeof EtsyListingSchema | undefined {
   if (isAmazonUrl(url)) {

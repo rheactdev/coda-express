@@ -233,7 +233,21 @@ MAX_EXISTING_OPTION_CHARS
 
 ## Firecrawl Scraping
 
-Generic sites use Markdown.
+Shopify product pages use a fast path before Firecrawl. If the URL looks like:
+
+```text
+https://store.com/products/product-handle
+```
+
+the backend first tries:
+
+```text
+https://store.com/products/product-handle.js
+```
+
+When that public Shopify product JSON endpoint works, the workflow uses it directly as structured product data and avoids Firecrawl for that page.
+
+Generic non-Shopify sites use Markdown.
 
 Amazon and Etsy use Firecrawl's JSON format plus Markdown:
 

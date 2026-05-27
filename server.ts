@@ -236,8 +236,8 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
   try {
     return await run();
   } catch (error) {
-    logSanitizedError(stepName, error);
-    throw new Error(`Workflow step failed: ${stepName}`);
+    logWorkflowError(stepName, error);
+    throw new Error(`Workflow step failed: ${stepName}: ${formatErrorForLog(error)}`);
   }
 }
 
@@ -592,5 +592,74 @@ function asString(value: unknown): string | undefined {
 }
 
 function logSanitizedError(step: string, error: unknown): void {
-  console.error(`Workflow failure in step "${step}".`);
+  logWorkflowError(step, error);
+}
+
+function logWorkflowError(step: string, error: unknown): void {
+  console.error(`Workflow failure in step "${step}". ${formatErrorForLog(error)}`);
+}
+
+function formatErrorForLog(error: unknown): string {
+  return redactEnvValues(stringifyForLog(serializeError(error)));
+}
+
+function serializeError(error: unknown): unknown {
+  if (error instanceof Error) {
+    const serialized: Record<string, unknown> = {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+
+    for (const key of Object.getOwnPropertyNames(error)) {
+      if (!(key in serialized)) {
+        serialized[key] = (error as unknown as Record<string, unknown>)[key];
+      }
+    }
+
+    if ("cause" in error) {
+      serialized.cause = serializeError(error.cause);
+    }
+
+    return serialized;
+  }
+
+  return error;
+}
+
+function redactEnvValues(value: string): string {
+  let redacted = value;
+
+  for (const [name, rawEnvValue] of Object.entries(process.env)) {
+    if (!rawEnvValue || rawEnvValue.length < 8) {
+      continue;
+    }
+
+    redacted = redacted.replaceAll(rawEnvValue, `[redacted env:${name}]`);
+  }
+
+  return redacted;
+}
+
+function stringifyForLog(value: unknown): string {
+  const seen = new WeakSet<object>();
+
+  return JSON.stringify(
+    value,
+    (_key, nestedValue) => {
+      if (typeof nestedValue === "bigint") {
+        return nestedValue.toString();
+      }
+
+      if (nestedValue && typeof nestedValue === "object") {
+        if (seen.has(nestedValue)) {
+          return "[Circular]";
+        }
+        seen.add(nestedValue);
+      }
+
+      return nestedValue;
+    },
+    2,
+  );
 }

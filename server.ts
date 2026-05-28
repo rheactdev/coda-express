@@ -27,6 +27,7 @@ type CodaColumn = {
   type?: string;
   description?: string;
   calculated?: boolean;
+  display?: boolean;
   formula?: string;
   format?: {
     type?: string;
@@ -56,6 +57,7 @@ type TargetColumn = {
   existingOptions: string[];
   allowsMultipleValues: boolean;
   relationTableId?: string;
+  relationDisplayColumnName?: string;
 };
 
 type ScrapeResult = {
@@ -630,9 +632,10 @@ async function fetchCodaSchema(
 
     const type = normalizeCodaType(column);
     const relationTableId = getRelationTableId(column);
-    const existingOptions = relationTableId
-      ? await fetchRelationOptions(docId, relationTableId, codaToken)
-      : getStaticOptions(column);
+    const relationMetadata = relationTableId
+      ? await fetchRelationMetadata(docId, relationTableId, codaToken)
+      : undefined;
+    const existingOptions = relationMetadata?.existingOptions ?? getStaticOptions(column);
 
     columns.push({
       name: column.name,
@@ -641,6 +644,7 @@ async function fetchCodaSchema(
       existingOptions,
       allowsMultipleValues: allowsMultipleValues(column),
       relationTableId,
+      relationDisplayColumnName: relationMetadata?.displayColumnName,
     });
   }
 
@@ -651,21 +655,29 @@ async function fetchCodaSchema(
   return { table, columns };
 }
 
-async function fetchRelationOptions(
+async function fetchRelationMetadata(
   docId: string,
   relationTableId: string,
   codaToken: string,
-): Promise<string[]> {
-  const rows = await codaFetch<{ items: Array<{ name?: string; values?: Record<string, unknown> }> }>(
-    `/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(relationTableId)}/rows?useColumnNames=true&limit=500`,
-    codaToken,
-  );
+): Promise<{ existingOptions: string[]; displayColumnName: string }> {
+  const encodedDocId = encodeURIComponent(docId);
+  const encodedTableId = encodeURIComponent(relationTableId);
+  const [columns, rows] = await Promise.all([
+    codaFetch<{ items: CodaColumn[] }>(`/docs/${encodedDocId}/tables/${encodedTableId}/columns`, codaToken),
+    codaFetch<{ items: Array<{ name?: string; values?: Record<string, unknown> }> }>(
+      `/docs/${encodedDocId}/tables/${encodedTableId}/rows?useColumnNames=true&limit=500`,
+      codaToken,
+    ),
+  ]);
 
-  return dedupeStrings(
-    (rows.items ?? [])
-      .map((row) => row.name ?? firstStringValue(row.values))
-      .filter((value): value is string => Boolean(value)),
-  );
+  return {
+    existingOptions: dedupeStrings(
+      (rows.items ?? [])
+        .map((row) => row.name ?? firstStringValue(row.values))
+        .filter((value): value is string => Boolean(value)),
+    ),
+    displayColumnName: getRelationDisplayColumnName(columns.items ?? []),
+  };
 }
 
 async function extractData(
@@ -884,6 +896,8 @@ async function saveToCoda(
   extracted: Record<string, unknown>,
   columns: TargetColumn[],
 ): Promise<{ id?: string; requestId?: string }> {
+  await ensureRelationRowsExist(docId, codaToken, extracted, columns);
+
   const columnMap = new Map(columns.map((column) => [column.name, column]));
   const productContext = getProductContext(extracted);
   const cells = Object.entries(extracted)
@@ -918,6 +932,85 @@ async function saveToCoda(
 
 type CodaScalarValue = boolean | number | string;
 type CodaCellValue = CodaScalarValue | CodaScalarValue[] | null;
+
+async function ensureRelationRowsExist(
+  docId: string,
+  codaToken: string,
+  extracted: Record<string, unknown>,
+  columns: TargetColumn[],
+): Promise<void> {
+  for (const column of columns) {
+    if (!column.relationTableId || !column.relationDisplayColumnName) {
+      continue;
+    }
+
+    const rawValue = extracted[column.name];
+    const values = getRelationStringValues(rawValue)
+      .map((value) => normalizeExtractedStringValue(value, column))
+      .filter((value) => shouldCreateRelationOption(value, column.existingOptions));
+
+    if (values.length === 0) {
+      continue;
+    }
+
+    await createRelationRows(docId, codaToken, column, dedupeStrings(values));
+  }
+}
+
+function getRelationStringValues(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value.trim() ? [value.trim()] : [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+  }
+
+  return [];
+}
+
+function shouldCreateRelationOption(value: string, existingOptions: string[]): boolean {
+  return !findCoveringExistingOption(value, existingOptions);
+}
+
+async function createRelationRows(
+  docId: string,
+  codaToken: string,
+  column: TargetColumn,
+  values: string[],
+): Promise<void> {
+  const body = {
+    rows: values.map((value) => ({
+      cells: [
+        {
+          column: column.relationDisplayColumnName,
+          value,
+        },
+      ],
+    })),
+    useColumnNames: true,
+  };
+
+  console.info(`Coda relation row payload ${formatErrorForLog({ relationColumn: column.name, relationTableId: column.relationTableId, body })}`);
+
+  const response = await codaFetch<{ requestId?: string }>(
+    `/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(column.relationTableId!)}/rows`,
+    codaToken,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      logContext: {
+        codaRelationRowPayload: body,
+      },
+    },
+  );
+
+  if (response.requestId) {
+    await waitForCodaMutation(codaToken, response.requestId);
+  }
+
+  column.existingOptions.push(...values);
+}
 
 function toCodaCellValue(value: unknown, column?: TargetColumn | string, productContext = ""): CodaCellValue | undefined {
   const columnName = typeof column === "string" ? column : column?.name;
@@ -1200,12 +1293,60 @@ async function codaFetch<T>(
     );
   }
 
-  return JSON.parse(responseText) as T;
+  return (responseText ? JSON.parse(responseText) : {}) as T;
 }
 
 type CodaFetchInit = RequestInit & {
   logContext?: unknown;
 };
+
+async function waitForCodaMutation(codaToken: string, requestId: string): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const status = await codaFetch<Record<string, unknown>>(
+      `/mutationStatus/${encodeURIComponent(requestId)}`,
+      codaToken,
+    );
+
+    if (isCodaMutationComplete(status)) {
+      return;
+    }
+
+    if (isCodaMutationFailed(status)) {
+      throw new Error(`Coda mutation failed: ${formatErrorForLog(status)}`);
+    }
+
+    await delay(500);
+  }
+
+  throw new Error(`Timed out waiting for Coda mutation ${requestId}.`);
+}
+
+function isCodaMutationComplete(status: Record<string, unknown>): boolean {
+  return (
+    status.completed === true ||
+    status.done === true ||
+    status.status === "complete" ||
+    status.status === "completed" ||
+    status.status === "succeeded" ||
+    status.state === "complete" ||
+    status.state === "completed" ||
+    status.state === "succeeded"
+  );
+}
+
+function isCodaMutationFailed(status: Record<string, unknown>): boolean {
+  return (
+    status.status === "failed" ||
+    status.status === "error" ||
+    status.state === "failed" ||
+    status.state === "error" ||
+    Boolean(status.error)
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function isWritableColumn(column: CodaColumn): boolean {
   if (column.calculated) {
@@ -1256,6 +1397,25 @@ function getRelationTableId(column: CodaColumn): string | undefined {
   }
 
   return column.format?.tableId ?? column.format?.table?.id;
+}
+
+function getRelationDisplayColumnName(columns: CodaColumn[]): string {
+  const displayColumn = columns.find((column) => column.display && isWritableColumn(column));
+  if (displayColumn) {
+    return displayColumn.name;
+  }
+
+  const nameColumn = columns.find((column) => /^name$/i.test(column.name) && isWritableColumn(column));
+  if (nameColumn) {
+    return nameColumn.name;
+  }
+
+  const firstWritableColumn = columns.find(isWritableColumn);
+  if (!firstWritableColumn) {
+    throw new Error("Relation table has no writable display column.");
+  }
+
+  return firstWritableColumn.name;
 }
 
 function getStaticOptions(column: CodaColumn): string[] {

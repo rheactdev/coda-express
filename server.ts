@@ -759,8 +759,11 @@ async function refineCategoryFields(
       "Use existing options only when they are semantically correct.",
       "Do not use adjacent, merely related, or SEO-keyword tags.",
       "If no existing option fits, create a concise new product-level tag.",
+      "Do not use acronyms, abbreviations, or codes unless that exact term appears in the product title or product data.",
       "If a set contains one kind of item, use that item type.",
       "If a set contains multiple different item types, use the broader set/category tag when available.",
+      "For multi-select relation fields, include every semantically relevant row based on the field name and description.",
+      "For single-select fields, choose the one value most useful for browsing or filtering.",
       "Return a value for every category/tag field when the product type is inferable.",
     ].join("\n"),
     prompt: [
@@ -770,10 +773,57 @@ async function refineCategoryFields(
     ].join("\n"),
   });
 
-  return {
+  return repairInvalidCategoryOutputs({
     ...extracted,
     ...object,
-  };
+  }, categoryColumns, scraped);
+}
+
+function repairInvalidCategoryOutputs(
+  extracted: Record<string, unknown>,
+  categoryColumns: TargetColumn[],
+  scraped: ScrapeResult,
+): Record<string, unknown> {
+  const repaired = { ...extracted };
+  const title = getExtractedTitle(extracted) ?? asString(scraped.structuredData?.title);
+  const titleTag = inferTitleTag(title);
+  const titleContext = normalizeComparableText(title ?? "");
+
+  for (const column of categoryColumns) {
+    const value = repaired[column.name];
+
+    if (typeof value === "string") {
+      repaired[column.name] = repairCategoryValue(value, column, titleContext, titleTag);
+    }
+
+    if (Array.isArray(value)) {
+      repaired[column.name] = value.map((item) =>
+        typeof item === "string" ? repairCategoryValue(item, column, titleContext, titleTag) : item,
+      );
+    }
+  }
+
+  return repaired;
+}
+
+function repairCategoryValue(
+  value: string,
+  column: TargetColumn,
+  titleContext: string,
+  titleTag: string | undefined,
+): string {
+  if (!isSuspiciousNewTag(value, column.existingOptions, titleContext)) {
+    return value;
+  }
+
+  return titleTag ? findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag : value;
+}
+
+function isSuspiciousNewTag(value: string, existingOptions: string[], titleContext: string): boolean {
+  const normalizedValue = normalizeComparableText(value);
+  const rawValue = value.trim();
+  const acronymLike = /^[A-Z0-9&-]{2,6}$/.test(rawValue);
+  return acronymLike && !titleContext.includes(normalizedValue);
 }
 
 function buildCategoryRefinementSchema(columns: TargetColumn[]) {
@@ -781,8 +831,14 @@ function buildCategoryRefinementSchema(columns: TargetColumn[]) {
 
   for (const column of columns) {
     shape[column.name] = column.allowsMultipleValues
-      ? z.union([z.string(), z.array(z.string())]).nullable()
-      : z.string().nullable();
+      ? z
+          .array(z.string())
+          .nullable()
+          .describe("Return all semantically relevant existing or new values for this multi-select relation.")
+      : z
+          .string()
+          .nullable()
+          .describe("Return the single best existing or new value for browsing/filtering.");
   }
 
   return z.object(shape).strict();
@@ -1197,9 +1253,9 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
     }
 
     return z
-      .union([z.string(), z.array(z.string())])
+      .array(z.string())
       .nullable()
-      .describe(`${description} Return a string for one related item or an array of strings for multiple related items. Use existing options only for exact, synonym, subtype, or parent-child matches. Adjacent use-cases are not matches; prefer new precise tags over vague existing buckets. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
+      .describe(`${description} Return all semantically relevant related items for this multi-select relation, based on the column name and description. Use existing options only for exact, synonym, subtype, or parent-child matches. Adjacent use-cases are not matches; prefer new precise tags over vague existing buckets. If a set contains one kind of item, use that item type; if it contains multiple different item types, include the relevant item types and broader set/category only when the column name/description calls for it.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -1223,9 +1279,9 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
     }
 
     return z
-      .union([z.string(), z.array(z.string())])
+      .array(z.string())
       .nullable()
-      .describe(`${description} Return a string for one value or an array of strings for multiple values.`);
+      .describe(`${description} Return all semantically relevant values for this multi-select field, based on the column name and description.`);
   }
 
   if (type.includes("image") || type.includes("url") || type.includes("link")) {
@@ -1249,6 +1305,10 @@ function buildColumnDescription(column: TargetColumn): string {
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {
     parts.push("This column accepts only one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. Use an existing option only for an exact, synonym, subtype, or parent-child match. Adjacent use-cases are not matches; prefer a new precise tag over a vague existing bucket. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.");
+  }
+
+  if (isMultiValueType(column) && column.allowsMultipleValues) {
+    parts.push("This column accepts multiple values. Include every semantically relevant row based on this column's name and description. Do not include merely adjacent or SEO-keyword matches.");
   }
 
   return parts.join(" ");

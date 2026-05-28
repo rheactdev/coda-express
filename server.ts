@@ -683,6 +683,7 @@ async function extractData(
     system: [
       "Extract JSON for a Coda table from scraped page data.",
       "Use exact keys only. If absent, return null.",
+      "For tag/category/type fields, do not return null when the product type can be inferred from the title or product data; create a concise tag.",
       "Prefer structured product data over markdown.",
       "Relations/selects: use an existing option only for an exact, synonym, subtype, or parent-child match.",
       "Adjacent use-cases are not matches. Prefer a new precise tag over a vague existing bucket.",
@@ -730,34 +731,33 @@ function repairWeakTagMatches(
   scraped: ScrapeResult,
 ): Record<string, unknown> {
   const repaired = { ...extracted };
-  const productContext = normalizeComparableText(
-    [
-      getExtractedTitle(extracted),
-      asString(scraped.structuredData?.title),
-      asString(scraped.structuredData?.description),
-    ]
-      .filter(Boolean)
-      .join(" "),
-  );
-  const titleTag = inferTitleTag(getExtractedTitle(extracted) ?? asString(scraped.structuredData?.title));
+  const productTitle = getExtractedTitle(extracted) ?? asString(scraped.structuredData?.title);
+  const productTitleContext = normalizeComparableText(productTitle ?? "");
+  const titleTag = inferTitleTag(productTitle);
 
   if (!titleTag) {
     return repaired;
   }
 
   for (const column of columns) {
-    if (!isMultiValueType(column) || column.existingOptions.length === 0) {
+    if (!isMultiValueType(column)) {
       continue;
     }
 
     const value = repaired[column.name];
-    if (typeof value === "string" && isWeakExistingTagMatch(value, column.existingOptions, productContext)) {
+    if (isEmptyTagValue(value) && isCategoryLikeColumn(column)) {
+      const repairedTag = findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag;
+      repaired[column.name] = column.allowsMultipleValues ? [repairedTag] : repairedTag;
+      continue;
+    }
+
+    if (typeof value === "string" && isWeakExistingTagMatch(value, column.existingOptions, productTitleContext)) {
       repaired[column.name] = findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag;
     }
 
     if (Array.isArray(value)) {
       repaired[column.name] = value.map((item) =>
-        typeof item === "string" && isWeakExistingTagMatch(item, column.existingOptions, productContext)
+        typeof item === "string" && isWeakExistingTagMatch(item, column.existingOptions, productTitleContext)
           ? findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag
           : item,
       );
@@ -765,6 +765,19 @@ function repairWeakTagMatches(
   }
 
   return repaired;
+}
+
+function isEmptyTagValue(value: unknown): boolean {
+  return (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    (Array.isArray(value) && value.length === 0)
+  );
+}
+
+function isCategoryLikeColumn(column: TargetColumn): boolean {
+  return /\b(tag|tags|category|categories|type|kind)\b/i.test(column.name);
 }
 
 function getExtractedTitle(extracted: Record<string, unknown>): string | undefined {

@@ -705,7 +705,7 @@ async function extractData(
     ].join("\n"),
   });
 
-  return object as Record<string, unknown>;
+  return repairWeakTagMatches(object as Record<string, unknown>, codaSchema.columns, scraped);
 }
 
 function getPromptColumns(columns: TargetColumn[]) {
@@ -722,6 +722,115 @@ function getPromptExistingOptions(options: string[]): string[] {
   return options
     .slice(0, MAX_EXISTING_OPTIONS_IN_PROMPT)
     .map((option) => truncateString(option, MAX_EXISTING_OPTION_CHARS));
+}
+
+function repairWeakTagMatches(
+  extracted: Record<string, unknown>,
+  columns: TargetColumn[],
+  scraped: ScrapeResult,
+): Record<string, unknown> {
+  const repaired = { ...extracted };
+  const productContext = normalizeComparableText(
+    [
+      getExtractedTitle(extracted),
+      asString(scraped.structuredData?.title),
+      asString(scraped.structuredData?.description),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+  const titleTag = inferTitleTag(getExtractedTitle(extracted) ?? asString(scraped.structuredData?.title));
+
+  if (!titleTag) {
+    return repaired;
+  }
+
+  for (const column of columns) {
+    if (!isMultiValueType(column) || column.existingOptions.length === 0) {
+      continue;
+    }
+
+    const value = repaired[column.name];
+    if (typeof value === "string" && isWeakExistingTagMatch(value, column.existingOptions, productContext)) {
+      repaired[column.name] = findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag;
+    }
+
+    if (Array.isArray(value)) {
+      repaired[column.name] = value.map((item) =>
+        typeof item === "string" && isWeakExistingTagMatch(item, column.existingOptions, productContext)
+          ? findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag
+          : item,
+      );
+    }
+  }
+
+  return repaired;
+}
+
+function getExtractedTitle(extracted: Record<string, unknown>): string | undefined {
+  for (const [key, value] of Object.entries(extracted)) {
+    if (/\b(name|title)\b/i.test(key) && typeof value === "string") {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function isWeakExistingTagMatch(value: string, existingOptions: string[], productContext: string): boolean {
+  if (!existingOptions.some((option) => normalizeComparableText(option) === normalizeComparableText(value))) {
+    return false;
+  }
+
+  const valueTokens = comparableTokenSet(value);
+  const contextTokens = comparableTokenSet(productContext);
+  return ![...valueTokens].some((token) => contextTokens.has(token));
+}
+
+function inferTitleTag(title: string | undefined): string | undefined {
+  if (!title) {
+    return undefined;
+  }
+
+  const ignored = new Set([
+    "a",
+    "an",
+    "and",
+    "bundle",
+    "for",
+    "kit",
+    "of",
+    "pack",
+    "set",
+    "the",
+    "with",
+  ]);
+  const tokens = normalizeComparableText(title)
+    .split(" ")
+    .filter((token) => token.length > 2 && !ignored.has(token) && Number.isNaN(Number(token)));
+  const tagToken = tokens.at(-1);
+
+  return tagToken ? toTitleCase(singularizeToken(tagToken)) : undefined;
+}
+
+function toTitleCase(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function comparableTokenSet(value: string): Set<string> {
+  return new Set(normalizeComparableText(value).split(" ").filter(Boolean).map(singularizeToken));
+}
+
+function singularizeToken(value: string): string {
+  if (value.endsWith("ies") && value.length > 4) {
+    return `${value.slice(0, -3)}y`;
+  }
+
+  if (value.endsWith("s") && value.length > 3) {
+    return value.slice(0, -1);
+  }
+
+  return value;
 }
 
 function stringifyBounded(value: unknown, maxChars: number): string {
@@ -899,8 +1008,8 @@ function findCoveringExistingOption(value: string, existingOptions: string[]): s
 }
 
 function containsAllTokens(container: string, contained: string): boolean {
-  const containerTokens = new Set(container.split(" ").filter(Boolean));
-  return contained.split(" ").filter(Boolean).every((token) => containerTokens.has(token));
+  const containerTokens = comparableTokenSet(container);
+  return [...comparableTokenSet(contained)].every((token) => containerTokens.has(token));
 }
 
 function isUrlColumnName(columnName: string): boolean {
@@ -1009,14 +1118,6 @@ function buildColumnDescription(column: TargetColumn): string {
   const extractionHint = getColumnExtractionHint(column.name);
   if (extractionHint) {
     parts.push(extractionHint);
-  }
-
-  if (column.existingOptions.length > 0) {
-    const optionSuffix =
-      column.existingOptions.length > MAX_EXISTING_OPTIONS_IN_PROMPT
-        ? `, plus ${column.existingOptions.length - MAX_EXISTING_OPTIONS_IN_PROMPT} more`
-        : "";
-    parts.push(`Existing options: ${getPromptExistingOptions(column.existingOptions).join(", ")}${optionSuffix}.`);
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {

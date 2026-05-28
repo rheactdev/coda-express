@@ -706,7 +706,7 @@ async function extractData(
     ].join("\n"),
   });
 
-  return repairWeakTagMatches(object as Record<string, unknown>, codaSchema.columns, scraped);
+  return refineCategoryFields(object as Record<string, unknown>, codaSchema.columns, scraped);
 }
 
 function getPromptColumns(columns: TargetColumn[]) {
@@ -725,54 +725,73 @@ function getPromptExistingOptions(options: string[]): string[] {
     .map((option) => truncateString(option, MAX_EXISTING_OPTION_CHARS));
 }
 
-function repairWeakTagMatches(
+async function refineCategoryFields(
   extracted: Record<string, unknown>,
   columns: TargetColumn[],
   scraped: ScrapeResult,
-): Record<string, unknown> {
-  const repaired = { ...extracted };
-  const productTitle = getExtractedTitle(extracted) ?? asString(scraped.structuredData?.title);
-  const productTitleContext = normalizeComparableText(productTitle ?? "");
-  const titleTag = inferTitleTag(productTitle);
+): Promise<Record<string, unknown>> {
+  const categoryColumns = columns.filter((column) => isMultiValueType(column) && isCategoryLikeColumn(column));
 
-  if (!titleTag) {
-    return repaired;
+  if (categoryColumns.length === 0) {
+    return extracted;
   }
 
-  for (const column of columns) {
-    if (!isMultiValueType(column)) {
-      continue;
-    }
+  const schema = buildCategoryRefinementSchema(categoryColumns);
+  const { object } = await generateObject({
+    model: fireworksExtractionModel,
+    schema,
+    maxRetries: 0,
+    system: [
+      "Choose final category/tag values for a product.",
+      "Use the product title, structured data, description, and current extraction.",
+      "Use existing options only when they are semantically correct.",
+      "Do not use adjacent, merely related, or SEO-keyword tags.",
+      "If no existing option fits, create a concise new product-level tag.",
+      "If a set contains one kind of item, use that item type.",
+      "If a set contains multiple different item types, use the broader set/category tag when available.",
+      "Return a value for every category/tag field when the product type is inferable.",
+    ].join("\n"),
+    prompt: [
+      `current=${stringifyBounded(pickCategoryValues(extracted, categoryColumns), 2_000)}`,
+      `columns=${stringifyBounded(getPromptColumns(categoryColumns), 3_000)}`,
+      `product=${stringifyBounded(getCategoryProductContext(extracted, scraped), 5_000)}`,
+    ].join("\n"),
+  });
 
-    const value = repaired[column.name];
-    if (isEmptyTagValue(value) && isCategoryLikeColumn(column)) {
-      const repairedTag = findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag;
-      repaired[column.name] = column.allowsMultipleValues ? [repairedTag] : repairedTag;
-      continue;
-    }
-
-    if (typeof value === "string" && isWeakExistingTagMatch(value, column.existingOptions, productTitleContext)) {
-      repaired[column.name] = findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag;
-    }
-
-    if (Array.isArray(value)) {
-      repaired[column.name] = value.map((item) =>
-        typeof item === "string" && isWeakExistingTagMatch(item, column.existingOptions, productTitleContext)
-          ? findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag
-          : item,
-      );
-    }
-  }
-
-  return repaired;
+  return {
+    ...extracted,
+    ...object,
+  };
 }
 
-function isEmptyTagValue(value: unknown): boolean {
-  return (
-    value === null ||
-    value === undefined ||
-    value === "" ||
-    (Array.isArray(value) && value.length === 0)
+function buildCategoryRefinementSchema(columns: TargetColumn[]) {
+  const shape: Record<string, ZodTypeAny> = {};
+
+  for (const column of columns) {
+    shape[column.name] = column.allowsMultipleValues
+      ? z.union([z.string(), z.array(z.string())]).nullable()
+      : z.string().nullable();
+  }
+
+  return z.object(shape).strict();
+}
+
+function pickCategoryValues(extracted: Record<string, unknown>, columns: TargetColumn[]): Record<string, unknown> {
+  return Object.fromEntries(columns.map((column) => [column.name, extracted[column.name] ?? null]));
+}
+
+function getCategoryProductContext(extracted: Record<string, unknown>, scraped: ScrapeResult): Record<string, unknown> {
+  return {
+    extractedTitle: getExtractedTitle(extracted) ?? null,
+    structuredData: scraped.structuredData ?? null,
+    extractedFields: getProductContextFields(extracted),
+    markdown: truncateString(scraped.markdown, 2_500),
+  };
+}
+
+function getProductContextFields(extracted: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(extracted).filter(([key, value]) => isProductContextColumn(key) && typeof value === "string"),
   );
 }
 
@@ -885,6 +904,8 @@ async function saveToCoda(
     rows: [{ cells }],
     useColumnNames: true,
   };
+
+  console.info(`Coda save payload ${formatErrorForLog(body)}`);
 
   return codaFetch(`/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(tableId)}/rows`, codaToken, {
     method: "POST",

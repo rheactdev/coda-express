@@ -15,6 +15,7 @@ type SaveBookmarkPayload = {
   docId: string;
   tableId: string;
   codaToken?: string;
+  properties?: Record<string, unknown>;
 };
 
 type WorkflowSaveBookmarkPayload = SaveBookmarkPayload & {
@@ -155,7 +156,7 @@ app.post(
     );
 
     const extracted = await context.run("extract-data", () =>
-      runWorkflowStep("extract-data", () => extractData(scraped, codaSchema)),
+      runWorkflowStep("extract-data", () => extractData(scraped, codaSchema, input.properties)),
     );
 
     await context.run("save-to-coda", () =>
@@ -224,6 +225,7 @@ function parseSaveBookmarkPayload(
     docId: z.string().min(1),
     tableId: z.string().min(1),
     codaToken: z.string().min(1).optional(),
+    properties: z.record(z.string(), z.unknown()).optional(),
   });
 
   const result = schema.safeParse(body);
@@ -683,8 +685,17 @@ async function fetchRelationMetadata(
 async function extractData(
   scraped: ScrapeResult,
   codaSchema: { table: CodaTable; columns: TargetColumn[] },
+  providedProperties?: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const schema = buildExtractionSchema(codaSchema.columns);
+  const columnsToExtract = codaSchema.columns.filter(
+    (column) => !(providedProperties && column.name in providedProperties),
+  );
+
+  if (columnsToExtract.length === 0) {
+    return providedProperties ?? {};
+  }
+
+  const schema = buildExtractionSchema(columnsToExtract);
   const hasStructuredData = Boolean(scraped.structuredData);
   const markdownBudget = hasStructuredData ? MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA : MAX_MARKDOWN_CHARS;
 
@@ -714,7 +725,10 @@ async function extractData(
     ].join("\n"),
   });
 
-  return object as Record<string, unknown>;
+  return {
+    ...(object as Record<string, unknown>),
+    ...(providedProperties ?? {}),
+  };
 }
 
 function getPromptColumns(columns: TargetColumn[]) {

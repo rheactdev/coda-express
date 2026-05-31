@@ -15,6 +15,7 @@ type SaveBookmarkPayload = {
   docId: string;
   tableId: string;
   codaToken?: string;
+  properties?: Record<string, unknown>;
 };
 
 type WorkflowSaveBookmarkPayload = SaveBookmarkPayload & {
@@ -155,7 +156,7 @@ app.post(
     );
 
     const extracted = await context.run("extract-data", () =>
-      runWorkflowStep("extract-data", () => extractData(scraped, codaSchema)),
+      runWorkflowStep("extract-data", () => extractData(scraped, codaSchema, input.properties)),
     );
 
     await context.run("save-to-coda", () =>
@@ -224,6 +225,7 @@ function parseSaveBookmarkPayload(
     docId: z.string().min(1),
     tableId: z.string().min(1),
     codaToken: z.string().min(1).optional(),
+    properties: z.record(z.string(), z.unknown()).optional(),
   });
 
   const result = schema.safeParse(body);
@@ -683,8 +685,17 @@ async function fetchRelationMetadata(
 async function extractData(
   scraped: ScrapeResult,
   codaSchema: { table: CodaTable; columns: TargetColumn[] },
+  providedProperties?: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const schema = buildExtractionSchema(codaSchema.columns);
+  const columnsToExtract = codaSchema.columns.filter(
+    (column) => !(providedProperties && column.name in providedProperties),
+  );
+
+  if (columnsToExtract.length === 0) {
+    return providedProperties ?? {};
+  }
+
+  const schema = buildExtractionSchema(columnsToExtract);
   const hasStructuredData = Boolean(scraped.structuredData);
   const markdownBudget = hasStructuredData ? MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA : MAX_MARKDOWN_CHARS;
 
@@ -695,15 +706,11 @@ async function extractData(
     system: [
       "Extract JSON for a Coda table from scraped page data.",
       "Use exact keys only. If absent, return null.",
-      "For tag/category/type fields, do not return null when the product type can be inferred from the title or product data; create a concise tag.",
       "Prefer structured product data over markdown.",
-      "Relations/selects: use an existing option only for an exact, synonym, subtype, or parent-child match.",
-      "Adjacent use-cases are not matches. Prefer a new precise tag over a vague existing bucket.",
-      "If no existing option precisely describes the product, create a concise new product-level tag.",
-      "Avoid near-duplicate tags. If an existing compound option covers the product subtype, use it.",
-      "For product categories/tags, reason from the whole product description.",
-      "If a set contains one kind of item, use that item type. If it contains multiple different item types, use the broader set/category tag when available.",
-      "For single-select fields where multiple options fit, choose the one most useful for a user browsing or filtering the table later.",
+      "For relation/select fields, use the column name and description to decide what belongs.",
+      "For multi-select fields, include all values that are useful for browsing/filtering later.",
+      "For single-select fields, choose the one value that is most useful for browsing/filtering later.",
+      "Use existing options when they fit. Create a concise new value when none fit.",
       "Be concise. No commentary.",
     ].join("\n"),
     prompt: [
@@ -718,7 +725,10 @@ async function extractData(
     ].join("\n"),
   });
 
-  return refineCategoryFields(object as Record<string, unknown>, codaSchema.columns, scraped);
+  return {
+    ...(object as Record<string, unknown>),
+    ...(providedProperties ?? {}),
+  };
 }
 
 function getPromptColumns(columns: TargetColumn[]) {
@@ -735,186 +745,6 @@ function getPromptExistingOptions(options: string[]): string[] {
   return options
     .slice(0, MAX_EXISTING_OPTIONS_IN_PROMPT)
     .map((option) => truncateString(option, MAX_EXISTING_OPTION_CHARS));
-}
-
-async function refineCategoryFields(
-  extracted: Record<string, unknown>,
-  columns: TargetColumn[],
-  scraped: ScrapeResult,
-): Promise<Record<string, unknown>> {
-  const categoryColumns = columns.filter((column) => isMultiValueType(column) && isCategoryLikeColumn(column));
-
-  if (categoryColumns.length === 0) {
-    return extracted;
-  }
-
-  const schema = buildCategoryRefinementSchema(categoryColumns);
-  const { object } = await generateObject({
-    model: fireworksExtractionModel,
-    schema,
-    maxRetries: 0,
-    system: [
-      "Choose final category/tag values for a product.",
-      "Use the product title, structured data, description, and current extraction.",
-      "Use existing options only when they are semantically correct.",
-      "Do not use adjacent, merely related, or SEO-keyword tags.",
-      "If no existing option fits, create a concise new product-level tag.",
-      "Do not use acronyms, abbreviations, or codes unless that exact term appears in the product title or product data.",
-      "If a set contains one kind of item, use that item type.",
-      "If a set contains multiple different item types, use the broader set/category tag when available.",
-      "For multi-select relation fields, include every semantically relevant row based on the field name and description.",
-      "For single-select fields, choose the one value most useful for browsing or filtering.",
-      "Return a value for every category/tag field when the product type is inferable.",
-    ].join("\n"),
-    prompt: [
-      `current=${stringifyBounded(pickCategoryValues(extracted, categoryColumns), 2_000)}`,
-      `columns=${stringifyBounded(getPromptColumns(categoryColumns), 3_000)}`,
-      `product=${stringifyBounded(getCategoryProductContext(extracted, scraped), 5_000)}`,
-    ].join("\n"),
-  });
-
-  return repairInvalidCategoryOutputs({
-    ...extracted,
-    ...object,
-  }, categoryColumns, scraped);
-}
-
-function repairInvalidCategoryOutputs(
-  extracted: Record<string, unknown>,
-  categoryColumns: TargetColumn[],
-  scraped: ScrapeResult,
-): Record<string, unknown> {
-  const repaired = { ...extracted };
-  const title = getExtractedTitle(extracted) ?? asString(scraped.structuredData?.title);
-  const titleTag = inferTitleTag(title);
-  const titleContext = normalizeComparableText(title ?? "");
-
-  for (const column of categoryColumns) {
-    const value = repaired[column.name];
-
-    if (typeof value === "string") {
-      repaired[column.name] = repairCategoryValue(value, column, titleContext, titleTag);
-    }
-
-    if (Array.isArray(value)) {
-      repaired[column.name] = value.map((item) =>
-        typeof item === "string" ? repairCategoryValue(item, column, titleContext, titleTag) : item,
-      );
-    }
-  }
-
-  return repaired;
-}
-
-function repairCategoryValue(
-  value: string,
-  column: TargetColumn,
-  titleContext: string,
-  titleTag: string | undefined,
-): string {
-  if (!isSuspiciousNewTag(value, column.existingOptions, titleContext)) {
-    return value;
-  }
-
-  return titleTag ? findCoveringExistingOption(titleTag, column.existingOptions) ?? titleTag : value;
-}
-
-function isSuspiciousNewTag(value: string, existingOptions: string[], titleContext: string): boolean {
-  const normalizedValue = normalizeComparableText(value);
-  const rawValue = value.trim();
-  const acronymLike = /^[A-Z0-9&-]{2,6}$/.test(rawValue);
-  return acronymLike && !titleContext.includes(normalizedValue);
-}
-
-function buildCategoryRefinementSchema(columns: TargetColumn[]) {
-  const shape: Record<string, ZodTypeAny> = {};
-
-  for (const column of columns) {
-    shape[column.name] = column.allowsMultipleValues
-      ? z
-          .array(z.string())
-          .nullable()
-          .describe("Return all semantically relevant existing or new values for this multi-select relation.")
-      : z
-          .string()
-          .nullable()
-          .describe("Return the single best existing or new value for browsing/filtering.");
-  }
-
-  return z.object(shape).strict();
-}
-
-function pickCategoryValues(extracted: Record<string, unknown>, columns: TargetColumn[]): Record<string, unknown> {
-  return Object.fromEntries(columns.map((column) => [column.name, extracted[column.name] ?? null]));
-}
-
-function getCategoryProductContext(extracted: Record<string, unknown>, scraped: ScrapeResult): Record<string, unknown> {
-  return {
-    extractedTitle: getExtractedTitle(extracted) ?? null,
-    structuredData: scraped.structuredData ?? null,
-    extractedFields: getProductContextFields(extracted),
-    markdown: truncateString(scraped.markdown, 2_500),
-  };
-}
-
-function getProductContextFields(extracted: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(extracted).filter(([key, value]) => isProductContextColumn(key) && typeof value === "string"),
-  );
-}
-
-function isCategoryLikeColumn(column: TargetColumn): boolean {
-  return /\b(tag|tags|category|categories|type|kind)\b/i.test(column.name);
-}
-
-function getExtractedTitle(extracted: Record<string, unknown>): string | undefined {
-  for (const [key, value] of Object.entries(extracted)) {
-    if (/\b(name|title)\b/i.test(key) && typeof value === "string") {
-      return value;
-    }
-  }
-
-  return undefined;
-}
-
-function isWeakExistingTagMatch(value: string, existingOptions: string[], productContext: string): boolean {
-  if (!existingOptions.some((option) => normalizeComparableText(option) === normalizeComparableText(value))) {
-    return false;
-  }
-
-  const valueTokens = comparableTokenSet(value);
-  const contextTokens = comparableTokenSet(productContext);
-  return ![...valueTokens].some((token) => contextTokens.has(token));
-}
-
-function inferTitleTag(title: string | undefined): string | undefined {
-  if (!title) {
-    return undefined;
-  }
-
-  const ignored = new Set([
-    "a",
-    "an",
-    "and",
-    "bundle",
-    "for",
-    "kit",
-    "of",
-    "pack",
-    "set",
-    "the",
-    "with",
-  ]);
-  const tokens = normalizeComparableText(title)
-    .split(" ")
-    .filter((token) => token.length > 2 && !ignored.has(token) && Number.isNaN(Number(token)));
-  const tagToken = tokens.at(-1);
-
-  return tagToken ? toTitleCase(singularizeToken(tagToken)) : undefined;
-}
-
-function toTitleCase(value: string): string {
-  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function comparableTokenSet(value: string): Set<string> {
@@ -955,11 +785,10 @@ async function saveToCoda(
   await ensureRelationRowsExist(docId, codaToken, extracted, columns);
 
   const columnMap = new Map(columns.map((column) => [column.name, column]));
-  const productContext = getProductContext(extracted);
   const cells = Object.entries(extracted)
     .map(([column, value]) => ({
       column,
-      value: toCodaCellValue(value, columnMap.get(column) ?? column, productContext),
+      value: toCodaCellValue(value, columnMap.get(column) ?? column),
     }))
     .filter(
       (cell): cell is { column: string; value: Exclude<CodaCellValue, null> } =>
@@ -1068,9 +897,7 @@ async function createRelationRows(
   column.existingOptions.push(...values);
 }
 
-function toCodaCellValue(value: unknown, column?: TargetColumn | string, productContext = ""): CodaCellValue | undefined {
-  const columnName = typeof column === "string" ? column : column?.name;
-
+function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCellValue | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -1089,7 +916,7 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string, product
       .filter((item): item is CodaScalarValue => item !== undefined);
 
     if (typeof column !== "string" && column?.allowsMultipleValues === false) {
-      const selectedValue = selectBestProductLevelValue(values, productContext);
+      const selectedValue = values[0];
       return typeof selectedValue === "string"
         ? normalizeExtractedStringValue(selectedValue, column)
         : selectedValue;
@@ -1100,24 +927,6 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string, product
 
   const scalar = toCodaScalarValue(value);
   return typeof scalar === "string" ? normalizeExtractedStringValue(scalar, column) : scalar ?? JSON.stringify(value);
-}
-
-function getProductContext(extracted: Record<string, unknown>): string {
-  const contextParts: string[] = [];
-
-  for (const [key, value] of Object.entries(extracted)) {
-    if (!isProductContextColumn(key) || typeof value !== "string") {
-      continue;
-    }
-
-    contextParts.push(value);
-  }
-
-  return normalizeComparableText(contextParts.join(" "));
-}
-
-function isProductContextColumn(columnName: string): boolean {
-  return /\b(name|title|description|notes|summary|product)\b/i.test(columnName);
 }
 
 function toCodaScalarValue(value: unknown): CodaScalarValue | undefined {
@@ -1249,13 +1058,13 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one related item. Use an existing option only for an exact, synonym, subtype, or parent-child match. Adjacent use-cases are not matches; prefer a new precise tag over a vague existing bucket. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.`);
+        .describe(`${description} Return exactly one related item. Use the column name, description, and existing options to choose the value that is most useful for someone browsing or filtering the table later. Use an existing option when it fits; create a concise new value when no existing option fits.`);
     }
 
     return z
       .array(z.string())
       .nullable()
-      .describe(`${description} Return all semantically relevant related items for this multi-select relation, based on the column name and description. Use existing options only for exact, synonym, subtype, or parent-child matches. Adjacent use-cases are not matches; prefer new precise tags over vague existing buckets. If a set contains one kind of item, use that item type; if it contains multiple different item types, include the relevant item types and broader set/category only when the column name/description calls for it.`);
+      .describe(`${description} Return all semantically relevant related items for this multi-select relation. Use the column name, description, and existing options to choose values that are useful for someone browsing or filtering the table later. Use existing options when they fit; create concise new values when no existing options fit.`);
   }
 
   if (type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent")) {
@@ -1275,7 +1084,7 @@ function mapCodaTypeToZod(column: TargetColumn): ZodTypeAny {
       return z
         .string()
         .nullable()
-        .describe(`${description} Return exactly one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category value when available.`);
+        .describe(`${description} Return exactly one value. Use the column name, description, and existing options to choose the value that is most useful for someone browsing or filtering the table later.`);
     }
 
     return z
@@ -1304,11 +1113,11 @@ function buildColumnDescription(column: TargetColumn): string {
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues === false) {
-    parts.push("This column accepts only one value. If multiple options fit, choose the one most useful for a user browsing or filtering the table later. Use an existing option only for an exact, synonym, subtype, or parent-child match. Adjacent use-cases are not matches; prefer a new precise tag over a vague existing bucket. If a set contains one kind of item, use that item type; if it contains multiple different item types, use the broader set/category tag when available.");
+    parts.push("This column accepts only one value. If multiple values fit, choose the one that best matches this column's name and description and will be most useful for browsing or filtering later.");
   }
 
   if (isMultiValueType(column) && column.allowsMultipleValues) {
-    parts.push("This column accepts multiple values. Include every semantically relevant row based on this column's name and description. Do not include merely adjacent or SEO-keyword matches.");
+    parts.push("This column accepts multiple values. Include every semantically relevant value based on this column's name and description that will be useful for browsing or filtering later.");
   }
 
   return parts.join(" ");
@@ -1508,72 +1317,6 @@ function firstStringValue(values: Record<string, unknown> | undefined): string |
 
 function dedupeStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-}
-
-function selectBestProductLevelValue(values: CodaScalarValue[], productContext: string): CodaScalarValue | undefined {
-  if (values.length === 0) {
-    return undefined;
-  }
-
-  const strings = values.filter((value): value is string => typeof value === "string");
-  if (strings.length === 0) {
-    return values[0];
-  }
-
-  return strings.reduce((best, candidate) =>
-    getProductLevelMatchScore(candidate, strings, productContext) > getProductLevelMatchScore(best, strings, productContext) ? candidate : best,
-  );
-}
-
-function getProductLevelMatchScore(value: string, candidates: string[], productContext: string): number {
-  const normalized = normalizeComparableText(value);
-  const tokens = normalized.split(" ").filter(Boolean);
-  const containsAnotherCandidate = candidates.some((candidate) => {
-    const candidateText = normalizeComparableText(candidate);
-    return candidateText !== normalized && normalized.includes(candidateText);
-  });
-  const containedByAnotherCandidate = candidates.some((candidate) => {
-    const candidateText = normalizeComparableText(candidate);
-    return candidateText !== normalized && candidateText.includes(normalized);
-  });
-
-  return (
-    normalized.length +
-    tokens.length * 2 +
-    (containsAnotherCandidate ? 4 : 0) -
-    (containedByAnotherCandidate ? 4 : 0) -
-    getBroadCategoryPenalty(tokens) +
-    getProductContextTokenBonus(tokens, productContext)
-  );
-}
-
-function getProductContextTokenBonus(tokens: string[], productContext: string): number {
-  const contextTokens = new Set(productContext.split(" ").filter(Boolean));
-  return tokens.reduce((bonus, token) => bonus + (contextTokens.has(token) ? 14 : 0), 0);
-}
-
-function getBroadCategoryPenalty(tokens: string[]): number {
-  const broadCategoryTerms = new Set([
-    "accessory",
-    "accessories",
-    "apparel",
-    "clothes",
-    "clothing",
-    "custom",
-    "general",
-    "gift",
-    "gifts",
-    "item",
-    "items",
-    "merch",
-    "merchandise",
-    "misc",
-    "other",
-    "product",
-    "products",
-  ]);
-
-  return tokens.reduce((penalty, token) => penalty + (broadCategoryTerms.has(token) ? 6 : 0), 0);
 }
 
 function normalizeComparableText(value: string): string {

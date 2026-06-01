@@ -927,7 +927,13 @@ function toCodaCellValue(value: unknown, column?: TargetColumn | string): CodaCe
         : selectedValue;
     }
 
-    return values.map((item) => (typeof item === "string" ? normalizeExtractedStringValue(item, column) : item));
+    const mappedValues = values.map((item) => (typeof item === "string" ? normalizeExtractedStringValue(item, column) : item));
+
+    if (typeof column !== "string" && column?.relationTableId) {
+      return mappedValues.join(", ");
+    }
+
+    return mappedValues;
   }
 
   const scalar = toCodaScalarValue(value);
@@ -1176,17 +1182,25 @@ type CodaFetchInit = RequestInit & {
 
 async function waitForCodaMutation(codaToken: string, requestId: string): Promise<void> {
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    const status = await codaFetch<Record<string, unknown>>(
-      `/mutationStatus/${encodeURIComponent(requestId)}`,
-      codaToken,
-    );
+    try {
+      const status = await codaFetch<Record<string, unknown>>(
+        `/mutationStatus/${encodeURIComponent(requestId)}`,
+        codaToken,
+      );
 
-    if (isCodaMutationComplete(status)) {
-      return;
-    }
+      if (isCodaMutationComplete(status)) {
+        return;
+      }
 
-    if (isCodaMutationFailed(status)) {
-      throw new Error(`Coda mutation failed: ${formatErrorForLog(status)}`);
+      if (isCodaMutationFailed(status)) {
+        throw new Error(`Coda mutation failed: ${formatErrorForLog(status)}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("404")) {
+        console.info(`Coda mutation ${requestId} status returned 404. Assuming it completed or expired.`);
+        return;
+      }
+      throw error;
     }
 
     await delay(500);

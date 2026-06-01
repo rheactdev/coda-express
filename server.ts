@@ -160,6 +160,12 @@ app.post(
       runWorkflowStep("extract-data", () => extractData(scraped, codaSchema, input.properties)),
     );
 
+    await context.run("ensure-relation-rows", () =>
+      runWorkflowStep("ensure-relation-rows", () =>
+        ensureRelationRowsExist(input.docId, input.codaToken, extracted, codaSchema.columns),
+      ),
+    );
+
     await context.run("save-to-coda", () =>
       runWorkflowStep("save-to-coda", () =>
         saveToCoda(input.docId, input.tableId, input.codaToken, extracted, codaSchema.columns),
@@ -783,8 +789,6 @@ async function saveToCoda(
   extracted: Record<string, unknown>,
   columns: TargetColumn[],
 ): Promise<{ id?: string; requestId?: string }> {
-  await ensureRelationRowsExist(docId, codaToken, extracted, columns);
-
   const columnMap = new Map(columns.map((column) => [column.name, column]));
   const cells = Object.entries(extracted)
     .map(([column, value]) => ({

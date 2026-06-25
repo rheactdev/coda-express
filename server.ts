@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
+import swaggerUi from "swagger-ui-express";
 import { config } from "dotenv";
 import { Client } from "@upstash/workflow";
 import { serve } from "@upstash/workflow/express";
@@ -78,9 +79,245 @@ const MAX_STRUCTURED_DATA_CHARS = 6_000;
 const MAX_COLUMN_DESCRIPTION_CHARS = 240;
 const MAX_EXISTING_OPTIONS_IN_PROMPT = 40;
 const MAX_EXISTING_OPTION_CHARS = 80;
+const openApiDocument = {
+  openapi: "3.0.3",
+  info: {
+    title: "Coda Express Web Clipper API",
+    version: "1.0.0",
+    description:
+      "Backend API for saving clipped product and page data into user-selected Coda tables.",
+  },
+  servers: [
+    {
+      url: "/",
+      description: "Current server",
+    },
+  ],
+  tags: [
+    {
+      name: "Bookmarks",
+      description: "Accept clipped URLs and start background save workflows.",
+    },
+    {
+      name: "Workflow",
+      description: "Internal Upstash Workflow callbacks.",
+    },
+  ],
+  paths: {
+    "/api/save-bookmark": {
+      post: {
+        tags: ["Bookmarks"],
+        summary: "Save a clipped URL to Coda",
+        description:
+          "Validates a clipping request, triggers the Upstash workflow, and returns the workflow run id.",
+        security: [{ apiKeyAuth: [], codaBearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                $ref: "#/components/schemas/SaveBookmarkRequest",
+              },
+              examples: {
+                amazonProduct: {
+                  summary: "Product URL",
+                  value: {
+                    url: "https://www.amazon.com/dp/B0G6YDKYM8",
+                    docId: "abc123",
+                    tableId: "grid-xyz",
+                  },
+                },
+                bodyTokenFallback: {
+                  summary: "Compatibility token fallback",
+                  value: {
+                    url: "https://example.com/product",
+                    docId: "abc123",
+                    tableId: "grid-xyz",
+                    codaToken: "coda-api-token",
+                    properties: {
+                      source: "browser-extension",
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Workflow was triggered.",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/SaveBookmarkResponse",
+                },
+              },
+            },
+          },
+          "400": {
+            description: "The request body is missing required data or contains invalid values.",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/ErrorResponse",
+                },
+              },
+            },
+          },
+          "401": {
+            description: "The backend API key is missing or invalid.",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/ErrorResponse",
+                },
+              },
+            },
+          },
+          "500": {
+            description: "The request was accepted, but the workflow could not be started.",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/WorkflowTriggerErrorResponse",
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/api/workflow/save-bookmark": {
+      post: {
+        tags: ["Workflow"],
+        summary: "Run the save-bookmark workflow",
+        description:
+          "Internal Upstash Workflow endpoint. Client applications should call /api/save-bookmark instead.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                $ref: "#/components/schemas/WorkflowSaveBookmarkRequest",
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Workflow step execution response handled by Upstash Workflow.",
+          },
+        },
+      },
+    },
+  },
+  components: {
+    securitySchemes: {
+      apiKeyAuth: {
+        type: "apiKey",
+        in: "header",
+        name: "x-api-key",
+        description: "Shared backend API key.",
+      },
+      codaBearerAuth: {
+        type: "http",
+        scheme: "bearer",
+        description: "User Coda API token.",
+      },
+    },
+    schemas: {
+      SaveBookmarkRequest: {
+        type: "object",
+        required: ["url", "docId", "tableId"],
+        properties: {
+          url: {
+            type: "string",
+            format: "uri",
+            description: "Page or product URL to scrape.",
+          },
+          docId: {
+            type: "string",
+            description: "Coda doc id or doc URL.",
+          },
+          tableId: {
+            type: "string",
+            description: "Coda table id or table URL/hash.",
+          },
+          codaToken: {
+            type: "string",
+            description:
+              "Compatibility fallback for the Coda token. Prefer Authorization: Bearer ... instead.",
+          },
+          properties: {
+            type: "object",
+            additionalProperties: true,
+            description: "Optional extra context passed to the extraction model.",
+          },
+        },
+      },
+      WorkflowSaveBookmarkRequest: {
+        allOf: [
+          {
+            $ref: "#/components/schemas/SaveBookmarkRequest",
+          },
+          {
+            type: "object",
+            required: ["codaToken"],
+            properties: {
+              codaToken: {
+                type: "string",
+                description: "Coda token used by the workflow worker.",
+              },
+            },
+          },
+        ],
+      },
+      SaveBookmarkResponse: {
+        type: "object",
+        required: ["ok", "workflowRunId"],
+        properties: {
+          ok: {
+            type: "boolean",
+            example: true,
+          },
+          workflowRunId: {
+            type: "string",
+            example: "wfr_123",
+          },
+        },
+      },
+      ErrorResponse: {
+        type: "object",
+        required: ["error"],
+        properties: {
+          error: {
+            type: "string",
+          },
+        },
+      },
+      WorkflowTriggerErrorResponse: {
+        type: "object",
+        required: ["ok", "error"],
+        properties: {
+          ok: {
+            type: "boolean",
+            example: false,
+          },
+          error: {
+            type: "string",
+          },
+        },
+      },
+    },
+  },
+};
 
 const app = express();
 
+app.get("/api/openapi.json", (_req: Request, res: Response) => {
+  res.json(openApiDocument);
+});
+app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument));
 app.use(express.json({ limit: "1mb" }));
 
 const workflowClient = new Client({
@@ -673,20 +910,55 @@ async function fetchRelationMetadata(
   const encodedTableId = encodeURIComponent(relationTableId);
   const [columns, rows] = await Promise.all([
     codaFetch<{ items: CodaColumn[] }>(`/docs/${encodedDocId}/tables/${encodedTableId}/columns`, codaToken),
-    codaFetch<{ items: Array<{ name?: string; values?: Record<string, unknown> }> }>(
-      `/docs/${encodedDocId}/tables/${encodedTableId}/rows?useColumnNames=true&limit=500`,
-      codaToken,
-    ),
+    fetchRelationRows(docId, relationTableId, codaToken),
   ]);
 
   return {
-    existingOptions: dedupeStrings(
-      (rows.items ?? [])
-        .map((row) => row.name ?? firstStringValue(row.values))
-        .filter((value): value is string => Boolean(value)),
-    ),
+    existingOptions: getRelationRowOptions(rows),
     displayColumnName: getRelationDisplayColumnName(columns.items ?? []),
   };
+}
+
+type CodaRowListItem = { name?: string; values?: Record<string, unknown> };
+
+async function fetchRelationRows(
+  docId: string,
+  relationTableId: string,
+  codaToken: string,
+): Promise<CodaRowListItem[]> {
+  const rows: CodaRowListItem[] = [];
+  const encodedDocId = encodeURIComponent(docId);
+  const encodedTableId = encodeURIComponent(relationTableId);
+  let pageToken: string | undefined;
+
+  do {
+    const query = new URLSearchParams({
+      useColumnNames: "true",
+      limit: "500",
+    });
+
+    if (pageToken) {
+      query.set("pageToken", pageToken);
+    }
+
+    const response = await codaFetch<{ items?: CodaRowListItem[]; nextPageToken?: string }>(
+      `/docs/${encodedDocId}/tables/${encodedTableId}/rows?${query.toString()}`,
+      codaToken,
+    );
+
+    rows.push(...(response.items ?? []));
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+
+  return rows;
+}
+
+function getRelationRowOptions(rows: CodaRowListItem[]): string[] {
+  return dedupeStrings(
+    rows
+      .map((row) => row.name ?? firstStringValue(row.values))
+      .filter((value): value is string => Boolean(value)),
+  );
 }
 
 async function extractData(
@@ -837,13 +1109,31 @@ async function ensureRelationRowsExist(
     const rawValue = extracted[column.name];
     const values = getRelationStringValues(rawValue)
       .map((value) => normalizeExtractedStringValue(value, column))
-      .filter((value) => shouldCreateRelationOption(value, column.existingOptions));
+      .filter(Boolean);
 
     if (values.length === 0) {
       continue;
     }
 
-    await createRelationRows(docId, codaToken, column, dedupeStrings(values));
+    const latestOptions = getRelationRowOptions(
+      await fetchRelationRows(docId, column.relationTableId, codaToken),
+    );
+    const existingOptions = dedupeStrings([...column.existingOptions, ...latestOptions]);
+    const canonicalValues = dedupeComparableStrings(
+      values.map((value) => findCoveringExistingOption(value, existingOptions) ?? value),
+    );
+    const missingValues = canonicalValues.filter((value) => shouldCreateRelationOption(value, existingOptions));
+
+    extracted[column.name] = column.allowsMultipleValues === false
+      ? canonicalValues[0] ?? null
+      : canonicalValues;
+
+    if (missingValues.length === 0) {
+      column.existingOptions = existingOptions;
+      continue;
+    }
+
+    await createRelationRows(docId, codaToken, column, dedupeComparableStrings(missingValues));
   }
 }
 
@@ -878,6 +1168,7 @@ async function createRelationRows(
         },
       ],
     })),
+    keyColumns: [column.relationDisplayColumnName],
     useColumnNames: true,
   };
 
@@ -1336,6 +1627,23 @@ function firstStringValue(values: Record<string, unknown> | undefined): string |
 
 function dedupeStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function dedupeComparableStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+
+  for (const value of values.map((item) => item.trim()).filter(Boolean)) {
+    const key = normalizeComparableText(value);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(value);
+  }
+
+  return deduped;
 }
 
 function normalizeComparableText(value: string): string {

@@ -38,6 +38,14 @@ Upstash Workflow worker
 
 ## Endpoints
 
+### `GET /api/docs`
+
+Interactive Swagger UI generated from the OpenAPI document.
+
+### `GET /api/openapi.json`
+
+Raw OpenAPI 3.0 document for API clients, documentation tooling, and contract checks.
+
 ### `POST /api/save-bookmark`
 
 Publisher endpoint used by the browser extension.
@@ -124,6 +132,12 @@ Run the server:
 
 ```bash
 pnpm run dev
+```
+
+Open the generated API docs:
+
+```text
+http://localhost:3000/api/docs
 ```
 
 Type-check:

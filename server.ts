@@ -420,13 +420,11 @@ app.post(
   }),
 );
 
-if (!process.env.VERCEL) {
-  const port = Number(process.env.PORT ?? 3000);
+const port = Number(process.env.PORT ?? 3000);
 
-  app.listen(port, () => {
-    console.log(`Server listening on port ${port}`);
-  });
-}
+app.listen(port, () => {
+  console.log(`Server listening on port ${port}`);
+});
 
 export default app;
 

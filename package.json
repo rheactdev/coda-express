@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "tsc --noEmit",
-    "start": "node dist/server.js"
+    "start": "tsx server.ts"
   },
   "dependencies": {
     "@ai-sdk/fireworks": "^2.0.0",

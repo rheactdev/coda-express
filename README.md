@@ -171,7 +171,7 @@ The local server listens on `PORT`, defaulting to `3000`.
 
 ## Vercel Deployment
 
-This repo includes [vercel.json](./vercel.json) so Vercel uses `server.ts` as the single serverless entrypoint instead of the legacy Express generator `app.js`.
+Vercel deploys this backend through its captured Node server support. The active entrypoint is [server.ts](./server.ts), which starts the Express app with `app.listen(...)`.
 
 Required Vercel env vars:
 
@@ -387,9 +387,9 @@ Only current `process.env` values are redacted from logs. This means page conten
 
 ## Troubleshooting
 
-### Vercel picks `app.js` instead of `server.ts`
+### Vercel returns a platform `NOT_FOUND`
 
-Make sure [vercel.json](./vercel.json) is deployed. Without it, Vercel may detect multiple entrypoints and pick the old Express generator app.
+Make sure the deployment is using Vercel's captured Node server support from [server.ts](./server.ts). This repo intentionally does not use a `vercel.json` `builds` override, because that can bypass the captured-server detection path.
 
 ### Firecrawl says `json format must be an object`
 

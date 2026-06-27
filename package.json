@@ -5,8 +5,8 @@
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "tsc --noEmit",
-    "start": "tsx server.ts"
+    "build": "tsc",
+    "start": "node dist/server.js"
   },
   "dependencies": {
     "@ai-sdk/fireworks": "^2.0.0",
@@ -18,7 +18,7 @@
     "cookie-parser": "~1.4.4",
     "debug": "~2.6.9",
     "dotenv": "^17.0.0",
-    "express": "~4.16.1",
+    "express": "^4.19.0",
     "http-errors": "~1.6.3",
     "jade": "~1.11.0",
     "morgan": "~1.9.1",

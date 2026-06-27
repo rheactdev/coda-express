@@ -2,14 +2,18 @@
   "version": 2,
   "builds": [
     {
-      "src": "server.ts",
-      "use": "@vercel/node"
+      "src": "package.json",
+      "use": "@vercel/node",
+      "config": {
+        "installCommand": "pnpm install --frozen-lockfile",
+        "buildCommand": "pnpm run build"
+      }
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "server.ts"
+      "dest": "dist/server.js"
     }
   ]
 }

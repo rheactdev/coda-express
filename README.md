@@ -93,6 +93,10 @@ API_KEY=
 FIREWORKS_API_KEY=
 FIREWORKS_MODEL=accounts/fireworks/models/gpt-oss-20b
 FIRECRAWL_API_KEY=
+B2_KEY_ID=
+B2_KEY_SECRET=
+B2_ENDPOINT=https://s3.us-east-005.backblazeb2.com
+B2_BUCKET_NAME=
 QSTASH_URL=
 QSTASH_TOKEN=
 QSTASH_CURRENT_SIGNING_KEY=
@@ -114,6 +118,18 @@ Optional Fireworks model id used for AI extraction. Defaults to `accounts/firewo
 ### `FIRECRAWL_API_KEY`
 
 Firecrawl API key used for page scraping.
+
+### `B2_KEY_ID`, `B2_KEY_SECRET`, `B2_ENDPOINT`, `B2_BUCKET_NAME`
+
+Optional Backblaze B2 S3-compatible config used to mirror saved image cells into a public B2 bucket before saving rows to Coda. If any of these are missing, image mirroring is disabled and original image URLs are saved.
+
+`B2_ENDPOINT` should include the protocol, for example:
+
+```env
+B2_ENDPOINT=https://s3.us-east-005.backblazeb2.com
+```
+
+If the protocol is omitted, the backend normalizes it to `https://`. The bucket must be public because Coda hotlinks the generated B2 URLs.
 
 ### `QSTASH_*`
 
@@ -162,6 +178,10 @@ Required Vercel env vars:
 - `API_KEY`
 - `FIREWORKS_API_KEY`
 - `FIRECRAWL_API_KEY`
+- `B2_KEY_ID` (optional; enables image mirroring)
+- `B2_KEY_SECRET` (optional; enables image mirroring)
+- `B2_ENDPOINT` (optional; enables image mirroring)
+- `B2_BUCKET_NAME` (optional; enables image mirroring)
 - `QSTASH_URL`
 - `QSTASH_TOKEN`
 - `QSTASH_CURRENT_SIGNING_KEY`
@@ -340,6 +360,24 @@ becomes:
 ```text
 https://www.amazon.com/dp/B0G6YDKYM8
 ```
+
+## B2 Image Mirroring
+
+When the B2 env vars are configured, the workflow mirrors image URLs that are actually being saved into image-like Coda columns before inserting the row. Image-like columns are Coda image columns or columns named like cover/image/photo/thumbnail/picture.
+
+The save flow checks for duplicate bookmark URLs before mirroring images, so duplicate rows do not upload anything to B2. New image uploads use Backblaze B2's S3-compatible API with multipart upload and a fixed 200 MB per-image cap. Uploaded objects are stored under:
+
+```text
+coda-bookmarker/images/{sha256(sourceUrl)}.{ext}
+```
+
+The generated public URL uses the configured endpoint and bucket:
+
+```text
+{B2_ENDPOINT}/{B2_BUCKET_NAME}/coda-bookmarker/images/{hash}.{ext}
+```
+
+If download, validation, or upload fails, the row still saves with the original source image URL and the workflow logs a warning.
 
 ## Logging
 

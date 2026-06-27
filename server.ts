@@ -1,4 +1,7 @@
 import crypto from "crypto";
+import { Readable, Transform, type TransformCallback } from "stream";
+import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 import express, { type NextFunction, type Request, type Response } from "express";
 import swaggerUi from "swagger-ui-express";
 import { config } from "dotenv";
@@ -80,6 +83,11 @@ const MAX_STRUCTURED_DATA_CHARS = 6_000;
 const MAX_COLUMN_DESCRIPTION_CHARS = 240;
 const MAX_EXISTING_OPTIONS_IN_PROMPT = 40;
 const MAX_EXISTING_OPTION_CHARS = 80;
+const B2_IMAGE_PREFIX = "coda-bookmarker/images";
+const B2_MAX_IMAGE_BYTES = 200_000_000;
+const B2_MULTIPART_PART_SIZE = 10 * 1024 * 1024;
+const B2_MULTIPART_QUEUE_SIZE = 2;
+const B2_IMAGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const openApiDocument = {
   openapi: "3.0.3",
   info: {
@@ -1323,6 +1331,8 @@ async function saveToCoda(
     }
   }
 
+  await mirrorImageCellsToB2(cells, columnMap);
+
   const body = {
     rows: [{ cells }],
     ...(urlDuplicateKey ? { keyColumns: [urlDuplicateKey.column.name] } : {}),
@@ -1384,6 +1394,296 @@ async function codaRowExistsByColumnValue(
 
 type CodaScalarValue = boolean | number | string;
 type CodaCellValue = CodaScalarValue | CodaScalarValue[] | null;
+type CodaCell = { column: string; value: Exclude<CodaCellValue, null> };
+
+type B2Config = {
+  keyId: string;
+  keySecret: string;
+  endpoint: string;
+  bucketName: string;
+  region: string;
+};
+
+let cachedB2Client: { configKey: string; client: S3Client } | undefined;
+
+async function mirrorImageCellsToB2(
+  cells: CodaCell[],
+  columnMap: Map<string, TargetColumn>,
+): Promise<void> {
+  const config = getB2Config();
+  if (!config) {
+    return;
+  }
+
+  const client = getB2Client(config);
+
+  for (const cell of cells) {
+    const column = columnMap.get(cell.column);
+    if (!column || !isImageColumn(column)) {
+      continue;
+    }
+
+    if (typeof cell.value === "string") {
+      cell.value = await mirrorImageUrlToB2(cell.value, config, client);
+      continue;
+    }
+
+    if (Array.isArray(cell.value)) {
+      const mirroredValues: CodaScalarValue[] = [];
+
+      for (const value of cell.value) {
+        mirroredValues.push(
+          typeof value === "string"
+            ? await mirrorImageUrlToB2(value, config, client)
+            : value,
+        );
+      }
+
+      cell.value = mirroredValues;
+    }
+  }
+}
+
+function getB2Config(): B2Config | undefined {
+  const keyId = process.env.B2_KEY_ID?.trim();
+  const keySecret = process.env.B2_KEY_SECRET?.trim();
+  const rawEndpoint = process.env.B2_ENDPOINT?.trim();
+  const bucketName = process.env.B2_BUCKET_NAME?.trim();
+
+  if (!keyId || !keySecret || !rawEndpoint || !bucketName) {
+    return undefined;
+  }
+
+  const endpoint = normalizeB2Endpoint(rawEndpoint);
+
+  return {
+    keyId,
+    keySecret,
+    endpoint,
+    bucketName,
+    region: getB2RegionFromEndpoint(endpoint),
+  };
+}
+
+function normalizeB2Endpoint(value: string): string {
+  const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+  return withProtocol.replace(/\/+$/, "");
+}
+
+function getB2RegionFromEndpoint(endpoint: string): string {
+  try {
+    const hostname = new URL(endpoint).hostname;
+    return hostname.match(/^s3[.-]([a-z0-9-]+)\./i)?.[1] ?? "us-east-005";
+  } catch {
+    return "us-east-005";
+  }
+}
+
+function getB2Client(config: B2Config): S3Client {
+  const configKey = `${config.endpoint}\n${config.bucketName}\n${config.keyId}`;
+  if (cachedB2Client?.configKey === configKey) {
+    return cachedB2Client.client;
+  }
+
+  const client = new S3Client({
+    region: config.region,
+    endpoint: config.endpoint,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: config.keyId,
+      secretAccessKey: config.keySecret,
+    },
+  });
+
+  cachedB2Client = { configKey, client };
+  return client;
+}
+
+function isImageColumn(column: TargetColumn): boolean {
+  return (
+    column.type.toLowerCase().includes("image") ||
+    /\b(image|photo|cover|thumbnail|picture)\b/i.test(column.name)
+  );
+}
+
+async function mirrorImageUrlToB2(
+  value: string,
+  config: B2Config,
+  client: S3Client,
+): Promise<string> {
+  if (!isHttpUrl(value)) {
+    return value;
+  }
+
+  try {
+    const response = await fetch(value);
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      throw new Error(`Image download failed with status ${response.status}.`);
+    }
+
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (!contentType?.startsWith("image/")) {
+      await cancelResponseBody(response);
+      throw new Error(`Image download returned non-image content type: ${contentType ?? "unknown"}.`);
+    }
+
+    const contentLength = getContentLength(response.headers);
+    if (contentLength !== undefined && contentLength > B2_MAX_IMAGE_BYTES) {
+      await cancelResponseBody(response);
+      throw new Error(`Image exceeds ${B2_MAX_IMAGE_BYTES} bytes: ${contentLength}.`);
+    }
+
+    if (!response.body) {
+      throw new Error("Image download returned no response body.");
+    }
+
+    const objectKey = getB2ObjectKey(value, contentType);
+    const publicUrl = getB2PublicUrl(config, objectKey);
+
+    if (await b2ObjectExists(client, config, objectKey)) {
+      await cancelResponseBody(response);
+      return publicUrl;
+    }
+
+    const body = streamWithByteLimit(
+      Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
+      B2_MAX_IMAGE_BYTES,
+    );
+
+    const upload = new Upload({
+      client,
+      params: {
+        Bucket: config.bucketName,
+        Key: objectKey,
+        Body: body,
+        ContentType: contentType,
+        CacheControl: B2_IMAGE_CACHE_CONTROL,
+      },
+      partSize: B2_MULTIPART_PART_SIZE,
+      queueSize: B2_MULTIPART_QUEUE_SIZE,
+    });
+
+    await upload.done();
+    return publicUrl;
+  } catch (error) {
+    console.warn(`B2 image mirror failed. Keeping original image URL. ${formatErrorForLog({ imageUrl: value, error })}`);
+    return value;
+  }
+}
+
+async function cancelResponseBody(response: globalThis.Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Nothing useful to do if the remote body cannot be cancelled.
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function getContentLength(headers: Headers): number | undefined {
+  const value = headers.get("content-length");
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function getB2ObjectKey(sourceUrl: string, contentType: string): string {
+  const hash = crypto.createHash("sha256").update(sourceUrl).digest("hex");
+  return `${B2_IMAGE_PREFIX}/${hash}.${getImageExtension(sourceUrl, contentType)}`;
+}
+
+function getImageExtension(sourceUrl: string, contentType: string): string {
+  const contentTypeExtension = getImageExtensionFromContentType(contentType);
+  if (contentTypeExtension) {
+    return contentTypeExtension;
+  }
+
+  try {
+    const extension = new URL(sourceUrl).pathname.match(/\.([A-Za-z0-9]{1,8})$/)?.[1]?.toLowerCase();
+    if (extension) {
+      return extension;
+    }
+  } catch {
+    // Fall through to the default extension.
+  }
+
+  return "bin";
+}
+
+function getImageExtensionFromContentType(contentType: string): string | undefined {
+  const extensionByContentType: Record<string, string> = {
+    "image/avif": "avif",
+    "image/bmp": "bmp",
+    "image/gif": "gif",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/svg+xml": "svg",
+    "image/tiff": "tiff",
+    "image/webp": "webp",
+    "image/x-icon": "ico",
+  };
+
+  return extensionByContentType[contentType];
+}
+
+async function b2ObjectExists(
+  client: S3Client,
+  config: B2Config,
+  objectKey: string,
+): Promise<boolean> {
+  try {
+    await client.send(new HeadObjectCommand({
+      Bucket: config.bucketName,
+      Key: objectKey,
+    }));
+    return true;
+  } catch (error) {
+    const statusCode = asRecord(error)?.$metadata && asRecord(asRecord(error)?.$metadata)?.httpStatusCode;
+    if (statusCode === 404 || asRecord(error)?.name === "NotFound") {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+function getB2PublicUrl(config: B2Config, objectKey: string): string {
+  return `${config.endpoint}/${encodeURIComponent(config.bucketName)}/${encodeObjectKeyPath(objectKey)}`;
+}
+
+function encodeObjectKeyPath(objectKey: string): string {
+  return objectKey.split("/").map(encodeURIComponent).join("/");
+}
+
+function streamWithByteLimit(stream: Readable, maxBytes: number): Readable {
+  let bytesRead = 0;
+
+  return stream.pipe(new Transform({
+    transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback) {
+      bytesRead += chunk.length;
+
+      if (bytesRead > maxBytes) {
+        callback(new Error(`Image stream exceeded ${maxBytes} bytes.`));
+        return;
+      }
+
+      callback(null, chunk);
+    },
+  }));
+}
 
 async function ensureRelationRowsExist(
   docId: string,

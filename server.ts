@@ -53,6 +53,7 @@ type CodaTable = {
 };
 
 type TargetColumn = {
+  id: string;
   name: string;
   type: string;
   description: string | null;
@@ -898,6 +899,7 @@ async function fetchCodaSchema(
     const existingOptions = relationMetadata?.existingOptions ?? getStaticOptions(column);
 
     columns.push({
+      id: column.id,
       name: column.name,
       type,
       description: column.description || null,
@@ -1305,8 +1307,25 @@ async function saveToCoda(
     throw new Error("No extracted cells to save.");
   }
 
+  const urlDuplicateKey = getUrlDuplicateKey(cells, columnMap);
+  if (urlDuplicateKey) {
+    const duplicateExists = await codaRowExistsByColumnValue(
+      docId,
+      tableId,
+      codaToken,
+      urlDuplicateKey.column.id,
+      urlDuplicateKey.value,
+    );
+
+    if (duplicateExists) {
+      console.info(`Skipping Coda save because URL already exists. ${formatErrorForLog({ urlColumn: urlDuplicateKey.column.name, url: urlDuplicateKey.value })}`);
+      return {};
+    }
+  }
+
   const body = {
     rows: [{ cells }],
+    ...(urlDuplicateKey ? { keyColumns: [urlDuplicateKey.column.name] } : {}),
     useColumnNames: true,
   };
 
@@ -1319,6 +1338,48 @@ async function saveToCoda(
       codaRowPayload: body,
     },
   });
+}
+
+function getUrlDuplicateKey(
+  cells: Array<{ column: string; value: Exclude<CodaCellValue, null> }>,
+  columnMap: Map<string, TargetColumn>,
+): { column: TargetColumn; value: string } | undefined {
+  for (const cell of cells) {
+    if (typeof cell.value !== "string") {
+      continue;
+    }
+
+    const column = columnMap.get(cell.column);
+    if (column && isUrlColumnName(column.name)) {
+      return {
+        column,
+        value: cell.value,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+async function codaRowExistsByColumnValue(
+  docId: string,
+  tableId: string,
+  codaToken: string,
+  columnId: string,
+  value: string,
+): Promise<boolean> {
+  const query = new URLSearchParams({
+    useColumnNames: "true",
+    limit: "1",
+    query: `${columnId}:${JSON.stringify(value)}`,
+  });
+
+  const response = await codaFetch<{ items?: unknown[] }>(
+    `/docs/${encodeURIComponent(docId)}/tables/${encodeURIComponent(tableId)}/rows?${query.toString()}`,
+    codaToken,
+  );
+
+  return Boolean(response.items?.length);
 }
 
 type CodaScalarValue = boolean | number | string;

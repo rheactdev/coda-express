@@ -544,7 +544,10 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
     };
   }
 
-  const structuredScrapeSchema = getStructuredScrapeSchema(url);
+  const structuredScrapeSource = getStructuredScrapeSource(url);
+  const structuredScrapeSchema = structuredScrapeSource
+    ? getStructuredScrapeSchema(structuredScrapeSource)
+    : undefined;
   const scrapeOptions = {
     formats: structuredScrapeSchema
       ? [
@@ -581,7 +584,10 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
     throw new Error("Firecrawl returned no markdown.");
   }
 
-  const metadata = getFirecrawlMetadata(response);
+  const metadata = {
+    ...getFirecrawlMetadata(response),
+    ...(structuredScrapeSource ? { source: structuredScrapeSource, url } : {}),
+  };
   const structuredData = getFirecrawlJson(response);
 
   return { markdown, metadata, structuredData };
@@ -827,16 +833,24 @@ function stripHtml(value: string): string {
   return value.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function getStructuredScrapeSchema(url: string): typeof AmazonProductSchema | typeof EtsyListingSchema | undefined {
+type StructuredScrapeSource = "amazon-product-json" | "etsy-listing-json";
+
+function getStructuredScrapeSource(url: string): StructuredScrapeSource | undefined {
   if (isAmazonUrl(url)) {
-    return AmazonProductSchema;
+    return "amazon-product-json";
   }
 
   if (isEtsyUrl(url)) {
-    return EtsyListingSchema;
+    return "etsy-listing-json";
   }
 
   return undefined;
+}
+
+function getStructuredScrapeSchema(
+  source: StructuredScrapeSource,
+): typeof AmazonProductSchema | typeof EtsyListingSchema {
+  return source === "amazon-product-json" ? AmazonProductSchema : EtsyListingSchema;
 }
 
 function isAmazonUrl(value: string): boolean {
@@ -974,40 +988,255 @@ async function extractData(
     return providedProperties ?? {};
   }
 
+  if (shouldSkipAiExtraction(scraped)) {
+    const deterministic = extractStructuredDataFallback(scraped, columnsToExtract);
+    return {
+      ...deterministic,
+      ...(providedProperties ?? {}),
+    };
+  }
+
   const schema = buildExtractionSchema(columnsToExtract);
   const hasStructuredData = Boolean(scraped.structuredData);
   const markdownBudget = hasStructuredData ? MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA : MAX_MARKDOWN_CHARS;
 
-  const { object } = await generateObject({
-    model: fireworksExtractionModel,
-    schema,
-    maxRetries: 0,
-    system: [
-      "Extract JSON for a Coda table from scraped page data.",
-      "Use exact keys only. If absent, return null.",
-      "Prefer structured product data over markdown.",
-      "For relation/select fields, use the column name and description to decide what belongs.",
-      "For multi-select fields, include all values that are useful for browsing/filtering later.",
-      "For single-select fields, choose the one value that is most useful for browsing/filtering later.",
-      "Use existing options when they fit. Create a concise new value when none fit.",
-      "Be concise. No commentary.",
-    ].join("\n"),
-    prompt: [
-      `table=${codaSchema.table.name}`,
-      codaSchema.table.description ? `tableDescription=${truncateString(codaSchema.table.description, 300)}` : "",
-      `columns=${stringifyBounded(getPromptColumns(codaSchema.columns), MAX_METADATA_CHARS)}`,
-      `metadata=${stringifyBounded(scraped.metadata, MAX_METADATA_CHARS)}`,
-      scraped.structuredData
-        ? `structuredProductData=${stringifyBounded(scraped.structuredData, MAX_STRUCTURED_DATA_CHARS)}`
-        : "",
-      `markdown=${truncateString(scraped.markdown, markdownBudget)}`,
-    ].join("\n"),
-  });
+  try {
+    const { object } = await generateObject({
+      model: fireworksExtractionModel,
+      schema,
+      maxRetries: 0,
+      system: [
+        "Extract JSON for a Coda table from scraped page data.",
+        "Use exact keys only. If absent, return null.",
+        "Prefer structured product data over markdown.",
+        "For relation/select fields, use the column name and description to decide what belongs.",
+        "For multi-select fields, include all values that are useful for browsing/filtering later.",
+        "For single-select fields, choose the one value that is most useful for browsing/filtering later.",
+        "Use existing options when they fit. Create a concise new value when none fit.",
+        "Be concise. No commentary.",
+      ].join("\n"),
+      prompt: [
+        `table=${codaSchema.table.name}`,
+        codaSchema.table.description ? `tableDescription=${truncateString(codaSchema.table.description, 300)}` : "",
+        `columns=${stringifyBounded(getPromptColumns(codaSchema.columns), MAX_METADATA_CHARS)}`,
+        `metadata=${stringifyBounded(scraped.metadata, MAX_METADATA_CHARS)}`,
+        scraped.structuredData
+          ? `structuredProductData=${stringifyBounded(scraped.structuredData, MAX_STRUCTURED_DATA_CHARS)}`
+          : "",
+        `markdown=${truncateString(scraped.markdown, markdownBudget)}`,
+      ].join("\n"),
+    });
 
-  return {
-    ...(object as Record<string, unknown>),
-    ...(providedProperties ?? {}),
-  };
+    return {
+      ...(object as Record<string, unknown>),
+      ...(providedProperties ?? {}),
+    };
+  } catch (error) {
+    const fallback = extractStructuredDataFallback(scraped, columnsToExtract);
+    if (Object.keys(fallback).length === 0) {
+      throw error;
+    }
+
+    console.warn(`AI extraction failed. Saving deterministic structured fallback. ${formatErrorForLog(error)}`);
+    return {
+      ...fallback,
+      ...(providedProperties ?? {}),
+    };
+  }
+}
+
+function shouldSkipAiExtraction(scraped: ScrapeResult): boolean {
+  const source = asString(scraped.metadata.source);
+  return Boolean(
+    scraped.structuredData &&
+      (
+        source === "shopify-product-json" ||
+        source === "amazon-product-json" ||
+        source === "etsy-listing-json"
+      ),
+  );
+}
+
+function extractStructuredDataFallback(
+  scraped: ScrapeResult,
+  columns: TargetColumn[],
+): Record<string, unknown> {
+  const product = asRecord(scraped.structuredData);
+  if (!product) {
+    return {};
+  }
+
+  const extracted: Record<string, unknown> = {};
+
+  for (const column of columns) {
+    const value = getStructuredProductColumnValue(product, scraped.metadata, column);
+    if (value !== undefined && value !== null && value !== "") {
+      extracted[column.name] = value;
+    }
+  }
+
+  return extracted;
+}
+
+function getStructuredProductColumnValue(
+  product: Record<string, unknown>,
+  metadata: Record<string, unknown>,
+  column: TargetColumn,
+): unknown {
+  const normalizedName = normalizeComparableText(column.name);
+  const type = column.type.toLowerCase();
+
+  if (/\b(name|title|product)\b/.test(normalizedName)) {
+    return asString(product.title);
+  }
+
+  if (/\b(price|cost|amount)\b/.test(normalizedName) || type.includes("currency")) {
+    return firstNumericValue(product.price, product.compareAtPrice);
+  }
+
+  if (/\b(note|notes|description|details|summary)\b/.test(normalizedName) || type.includes("canvas")) {
+    return getStructuredProductDescription(product);
+  }
+
+  if (/\b(image|photo|cover|thumbnail|picture)\b/.test(normalizedName) || type.includes("image")) {
+    return asString(product.productImage) ?? asString(asUnknownArray(product.imageUrls)[0]);
+  }
+
+  if (/\b(url|link|href|source)\b/.test(normalizedName) || type.includes("link")) {
+    return asString(metadata.url);
+  }
+
+  if (/\b(sku|model|asin|part number|product code)\b/.test(normalizedName)) {
+    return getStructuredProductSku(product);
+  }
+
+  if (/\b(brand|vendor|maker|manufacturer)\b/.test(normalizedName)) {
+    return firstString(product.brand, product.vendor);
+  }
+
+  if (/\b(shop|store|seller)\b/.test(normalizedName)) {
+    return firstString(product.shopName, product.vendor, product.brand);
+  }
+
+  if (/\b(availability|stock|status)\b/.test(normalizedName)) {
+    return asString(product.availability);
+  }
+
+  if (/\b(rating|stars)\b/.test(normalizedName)) {
+    return firstNumericValue(product.rating);
+  }
+
+  if (/\b(review|reviews)\b/.test(normalizedName)) {
+    return firstNumericValue(product.reviewCount);
+  }
+
+  if (/\b(currency)\b/.test(normalizedName)) {
+    return asString(product.currency);
+  }
+
+  if (/\b(material|materials)\b/.test(normalizedName)) {
+    return asStringArray(product.materials).join(", ") || undefined;
+  }
+
+  if (/\b(variation|variations|variant|variants|option|options)\b/.test(normalizedName)) {
+    return asStringArray(product.variations).join(", ") || undefined;
+  }
+
+  if (isMultiValueType(column)) {
+    return getStructuredProductOptionValue(product, column);
+  }
+
+  return undefined;
+}
+
+function firstNumericValue(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+
+    if (typeof value === "string" && value.trim()) {
+      const numericMatch = value.match(/-?\d[\d,]*(?:\.\d+)?/);
+      if (numericMatch) {
+        const numericValue = Number(numericMatch[0].replace(/,/g, ""));
+        if (Number.isFinite(numericValue)) {
+          return numericValue;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function getStructuredProductDescription(product: Record<string, unknown>): string | undefined {
+  return firstString(product.description) ?? (asStringArray(product.features).join("\n") || undefined);
+}
+
+function getStructuredProductSku(product: Record<string, unknown>): string | undefined {
+  const directSku = firstString(
+    product.sku,
+    product.modelNumber,
+    product.itemModelNumber,
+    product.asin,
+    product.listingId,
+  );
+
+  if (directSku) {
+    return directSku;
+  }
+
+  for (const variant of asArrayOfRecords(product.variants)) {
+    const variantSku = firstString(variant.sku);
+    if (variantSku) {
+      return variantSku;
+    }
+  }
+
+  return undefined;
+}
+
+function getStructuredProductOptionValue(
+  product: Record<string, unknown>,
+  column: TargetColumn,
+): string | string[] | undefined {
+  const candidates = [
+    asString(product.productType),
+    asString(product.brand),
+    asString(product.vendor),
+    asString(product.shopName),
+    ...asStringArray(product.tags),
+    ...asStringArray(product.materials),
+    ...asStringArray(product.variations),
+  ].filter((value): value is string => Boolean(value?.trim()));
+
+  const matchingOptions = dedupeComparableStrings(
+    candidates
+      .map((candidate) => findCoveringExistingOption(candidate, column.existingOptions))
+      .filter((option): option is string => Boolean(option)),
+  );
+
+  if (matchingOptions.length === 0) {
+    return undefined;
+  }
+
+  return column.allowsMultipleValues === false ? matchingOptions[0] : matchingOptions;
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
 }
 
 function getPromptColumns(columns: TargetColumn[]) {

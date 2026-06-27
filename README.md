@@ -432,7 +432,7 @@ For Amazon, it prefers Model Number / Item Model Number when present and falls b
 
 ## Repository Notes
 
-This project started from an Express generator template, so legacy files like `app.js`, `bin/www`, `routes/`, and `views/` still exist. The active backend is [server.ts](./server.ts).
+This project started from an Express generator template, so legacy folders like `routes/` and `views/` still exist. The active backend is [server.ts](./server.ts).
 
 ## Useful Commands
 

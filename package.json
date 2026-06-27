@@ -2,6 +2,7 @@
   "name": "coda-express",
   "version": "0.0.0",
   "private": true,
+  "packageManager": "pnpm@11.9.0",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "tsc --noEmit",

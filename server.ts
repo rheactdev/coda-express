@@ -70,7 +70,7 @@ type ScrapeResult = {
 
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
-const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2p6";
+const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL?.trim() || "accounts/fireworks/models/gpt-oss-20b";
 const API_KEY = requireEnv("API_KEY");
 const MAX_MARKDOWN_CHARS = 18_000;
 const MAX_MARKDOWN_CHARS_WITH_STRUCTURED_DATA = 8_000;

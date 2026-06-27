@@ -32,7 +32,7 @@ Upstash Workflow worker
 - Upstash Workflow / QStash for durable execution
 - Firecrawl for scraping
 - Vercel AI SDK with the Fireworks provider
-- Fireworks model: `accounts/fireworks/models/kimi-k2p6`
+- Fireworks model: configurable with `FIREWORKS_MODEL`
 - Coda API for schema lookup and row insertion
 - Zod for dynamic runtime extraction schemas
 
@@ -91,6 +91,7 @@ See [.env.example](./.env.example).
 PORT=3000
 API_KEY=
 FIREWORKS_API_KEY=
+FIREWORKS_MODEL=accounts/fireworks/models/gpt-oss-20b
 FIRECRAWL_API_KEY=
 QSTASH_URL=
 QSTASH_TOKEN=
@@ -105,6 +106,10 @@ Shared secret required by `/api/save-bookmark` in the `x-api-key` header.
 ### `FIREWORKS_API_KEY`
 
 Fireworks API key used by the AI SDK Fireworks provider.
+
+### `FIREWORKS_MODEL`
+
+Optional Fireworks model id used for AI extraction. Defaults to `accounts/fireworks/models/gpt-oss-20b`.
 
 ### `FIRECRAWL_API_KEY`
 
@@ -216,10 +221,10 @@ The AI prompt instructs the model:
 - Use exact schema keys.
 - For relation columns, prefer existing relation values.
 
-The model is hardcoded in code:
+The model can be set with `FIREWORKS_MODEL`:
 
-```ts
-const FIREWORKS_MODEL = "accounts/fireworks/models/kimi-k2p6";
+```env
+FIREWORKS_MODEL=accounts/fireworks/models/gpt-oss-20b
 ```
 
 ### Token Budget Controls

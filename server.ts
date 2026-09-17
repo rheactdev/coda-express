@@ -72,6 +72,11 @@ type ScrapeResult = {
   structuredData?: Record<string, unknown>;
 };
 
+type VGenLicenseOption = {
+  isEnabled?: boolean;
+  isExtraCost?: boolean;
+};
+
 const CODA_API_BASE = "https://coda.io/apis/v1";
 const WORKFLOW_PATH = "/api/workflow/save-bookmark";
 const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL?.trim() || "accounts/fireworks/models/gpt-oss-20b";
@@ -538,6 +543,10 @@ async function runWorkflowStep<T>(stepName: string, run: () => Promise<T>): Prom
 }
 
 async function scrapeUrl(url: string): Promise<ScrapeResult> {
+  if (isVGenServiceUrl(url)) {
+    return scrapeVGenServiceUrl(url);
+  }
+
   const shopifyProduct = await fetchShopifyProduct(url);
 
   if (shopifyProduct) {
@@ -549,6 +558,10 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
       },
       structuredData: shopifyProduct,
     };
+  }
+
+  if (isInstagramUrl(url)) {
+    return scrapeInstagramUrl(url);
   }
 
   const structuredScrapeSource = getStructuredScrapeSource(url);
@@ -578,11 +591,27 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
     throw new Error("Installed Firecrawl SDK does not expose a scrape method.");
   }
 
-  const response = await scrape.call(client, url, scrapeOptions);
+  let response: unknown;
+  try {
+    response = await scrape.call(client, url, scrapeOptions);
+  } catch (error) {
+    if (isUnsupportedFirecrawlSiteError(error)) {
+      console.warn(`Firecrawl does not support this site. Saving URL-only scrape. ${formatErrorForLog({ url, error })}`);
+      return createUrlOnlyScrape(url, "firecrawl-unsupported-site");
+    }
+
+    throw error;
+  }
+
   const responseRecord = asRecord(response);
 
   if (responseRecord?.success === false) {
     const error = asString(responseRecord.error) ?? "Unknown Firecrawl scrape error.";
+    if (isUnsupportedFirecrawlMessage(error)) {
+      console.warn(`Firecrawl does not support this site. Saving URL-only scrape. ${formatErrorForLog({ url, error })}`);
+      return createUrlOnlyScrape(url, "firecrawl-unsupported-site");
+    }
+
     throw new Error(`Firecrawl scrape failed: ${error}`);
   }
 
@@ -598,6 +627,82 @@ async function scrapeUrl(url: string): Promise<ScrapeResult> {
   const structuredData = getFirecrawlJson(response);
 
   return { markdown, metadata, structuredData };
+}
+
+async function scrapeInstagramUrl(url: string): Promise<ScrapeResult> {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+      },
+    });
+
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      console.warn(`Instagram metadata fetch failed. Saving URL-only scrape. ${formatErrorForLog({ url, status: response.status })}`);
+      return createUrlOnlyScrape(url, "instagram-metadata", {
+        fetchStatus: response.status,
+      });
+    }
+
+    const html = await response.text();
+    const metadata = extractHtmlMetadata(html);
+    const structuredData = getInstagramStructuredData(url, metadata);
+
+    if (!structuredData.title && !structuredData.description && !structuredData.productImage) {
+      return createUrlOnlyScrape(url, "instagram-metadata");
+    }
+
+    return {
+      markdown: instagramMetadataToMarkdown(url, structuredData),
+      metadata: {
+        source: "instagram-metadata",
+        url,
+        ...metadata,
+      },
+      structuredData,
+    };
+  } catch (error) {
+    console.warn(`Instagram metadata fetch failed. Saving URL-only scrape. ${formatErrorForLog({ url, error })}`);
+    return createUrlOnlyScrape(url, "instagram-metadata");
+  }
+}
+
+function createUrlOnlyScrape(
+  url: string,
+  source: string,
+  extraMetadata: Record<string, unknown> = {},
+): ScrapeResult {
+  return {
+    markdown: [
+      "Bookmark URL",
+      `Source: ${source}`,
+      `URL: ${url}`,
+      "Content note: Page content could not be scraped automatically.",
+    ].join("\n"),
+    metadata: {
+      source,
+      url,
+      ...extraMetadata,
+    },
+    structuredData: {
+      title: null,
+      description: null,
+      productImage: null,
+      url,
+    },
+  };
+}
+
+function isUnsupportedFirecrawlSiteError(error: unknown): boolean {
+  return isUnsupportedFirecrawlMessage(formatErrorForLog(error));
+}
+
+function isUnsupportedFirecrawlMessage(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return normalized.includes("do not support this site") || normalized.includes("unsupported site");
 }
 
 const AmazonProductSchema = z.object({
@@ -878,6 +983,408 @@ function isEtsyUrl(value: string): boolean {
   }
 }
 
+function isInstagramUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.replace(/^www\./i, "").toLowerCase();
+    return hostname === "instagram.com" || hostname.endsWith(".instagram.com");
+  } catch {
+    return false;
+  }
+}
+
+function isVGenServiceUrl(value: string): boolean {
+  return Boolean(parseVGenServiceUrl(value));
+}
+
+function parseVGenServiceUrl(value: string):
+  | { artistName: string; serviceSlug: string; serviceId?: string }
+  | undefined {
+  try {
+    const parsedUrl = new URL(value);
+    const hostname = parsedUrl.hostname.replace(/^www\./i, "").toLowerCase();
+    const pathParts = parsedUrl.pathname.split("/").filter(Boolean);
+
+    if (hostname !== "vgen.co" || pathParts.length < 3 || pathParts[1] !== "service") {
+      return undefined;
+    }
+
+    return {
+      artistName: decodeURIComponent(pathParts[0]),
+      serviceSlug: decodeURIComponent(pathParts[2]),
+      serviceId: pathParts[3] ? decodeURIComponent(pathParts[3]) : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function scrapeVGenServiceUrl(url: string): Promise<ScrapeResult> {
+  const serviceUrl = parseVGenServiceUrl(url);
+
+  if (!serviceUrl) {
+    return createUrlOnlyScrape(url, "vgen-service-html");
+  }
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+      },
+    });
+
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      console.warn("VGen metadata fetch failed. Saving URL-only scrape. " + formatErrorForLog({ url, status: response.status }));
+      return createUrlOnlyScrape(url, "vgen-service-html", {
+        fetchStatus: response.status,
+        ...serviceUrl,
+      });
+    }
+
+    const html = await response.text();
+    const metadata = extractHtmlMetadata(html);
+    const structuredData = extractVGenServiceData(url, html, metadata, serviceUrl);
+
+    if (!structuredData.serviceName && !structuredData.price && !structuredData.productImage) {
+      return createUrlOnlyScrape(url, "vgen-service-html", serviceUrl);
+    }
+
+    return {
+      markdown: vgenServiceToMarkdown(structuredData),
+      metadata: {
+        source: "vgen-service-html",
+        url,
+        ...serviceUrl,
+        ...metadata,
+      },
+      structuredData,
+    };
+  } catch (error) {
+    console.warn("VGen metadata fetch failed. Saving URL-only scrape. " + formatErrorForLog({ url, error }));
+    return createUrlOnlyScrape(url, "vgen-service-html", serviceUrl);
+  }
+}
+
+function extractVGenServiceData(
+  url: string,
+  html: string,
+  metadata: Record<string, unknown>,
+  serviceUrl: { artistName: string; serviceSlug: string; serviceId?: string },
+): Record<string, unknown> {
+  const service = getVGenServiceFromHtml(html, serviceUrl);
+  const serviceName = firstString(
+    asString(service?.serviceName),
+    getVGenServiceNameFromTitle(asString(metadata.title)),
+    serviceUrl.serviceSlug.replace(/-/g, " "),
+  );
+  const description = firstString(
+    slateJsonToPlainText(asString(service?.description)),
+    asString(metadata.description),
+  );
+  const galleryItems = asArrayOfRecords(service?.galleryItems);
+  const imageUrls = dedupeComparableStrings([
+    ...galleryItems.map((item) => asString(item.url)).filter((value): value is string => Boolean(value)),
+    asString(metadata.image),
+  ].filter((value): value is string => Boolean(value)));
+  const licenseInfo = asRecord(service?.licenseInfo);
+  const commercialContent = getVGenLicenseStatus(asRecord(licenseInfo?.commercialContent));
+  const merchandising = getVGenLicenseStatus(asRecord(licenseInfo?.commercialMerchandising));
+  const commercialContentCost = getVGenLicenseCost(html, "Commercial: Content");
+  const merchandisingCost = getVGenLicenseCost(html, "Commercial: Merchandising");
+  const price = normalizeVGenPrice(service?.basePrice);
+
+  return {
+    title: serviceName ?? null,
+    serviceName: serviceName ?? null,
+    description: description ?? null,
+    price: price ?? null,
+    cost: price ?? null,
+    currency: asString(service?.currency) ?? "USD",
+    productImage: imageUrls[0] ?? null,
+    imageUrls,
+    url,
+    sourceUrl: url,
+    artistName: serviceUrl.artistName,
+    serviceSlug: serviceUrl.serviceSlug,
+    serviceId: asString(service?.serviceID) ?? serviceUrl.serviceId ?? null,
+    commercialContentUseAllowed: commercialContent,
+    commercialContent,
+    commercialContentPercentage: commercialContentCost.percentage ?? null,
+    commercialContentFlatRate: commercialContentCost.flatRate ?? null,
+    merchandising,
+    commercialMerchandising: merchandising,
+    merchandisingPercentage: merchandisingCost.percentage ?? null,
+    merchandisingFlatRate: merchandisingCost.flatRate ?? null,
+    tags: asStringArray(service?.tags),
+  };
+}
+
+function getVGenServiceFromHtml(
+  html: string,
+  serviceUrl: { serviceSlug: string; serviceId?: string },
+): Record<string, unknown> | undefined {
+  const nextData = getVGenNextData(html);
+  const pageProps = asRecord(getNestedRecord(nextData, "props")?.pageProps);
+  const linkedService = asRecord(pageProps?.linkedService);
+
+  if (linkedService) {
+    return linkedService;
+  }
+
+  const services = asArrayOfRecords(pageProps?.services);
+  return services.find((service) => {
+    const serviceId = asString(service.serviceID);
+    const serviceName = asString(service.serviceName);
+
+    return (
+      (serviceUrl.serviceId && serviceId === serviceUrl.serviceId) ||
+      (serviceName && slugifyVGenText(serviceName) === serviceUrl.serviceSlug)
+    );
+  });
+}
+
+function getVGenNextData(html: string): Record<string, unknown> | undefined {
+  const match = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!match) {
+    return undefined;
+  }
+
+  try {
+    return asRecord(JSON.parse(decodeHtmlEntities(match[1])));
+  } catch {
+    return undefined;
+  }
+}
+
+function slateJsonToPlainText(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  try {
+    const nodes = JSON.parse(value) as unknown;
+    const parts: string[] = [];
+
+    const visit = (node: unknown): void => {
+      if (Array.isArray(node)) {
+        for (const child of node) {
+          visit(child);
+        }
+        return;
+      }
+
+      const record = asRecord(node);
+      if (!record) {
+        return;
+      }
+
+      const text = asString(record.text);
+      if (text !== undefined) {
+        parts.push(text);
+      }
+
+      if (record.children) {
+        visit(record.children);
+        parts.push("\n");
+      }
+    };
+
+    visit(nodes);
+    return parts.join("").replace(/\n{3,}/g, "\n\n").trim() || undefined;
+  } catch {
+    return value;
+  }
+}
+
+function getVGenLicenseStatus(option: VGenLicenseOption | undefined): "no" | "upcharge" | "included" | null {
+  if (!option?.isEnabled) {
+    return "no";
+  }
+
+  return option.isExtraCost ? "upcharge" : "included";
+}
+
+function getVGenLicenseCost(html: string, label: string): { percentage?: number; flatRate?: number } {
+  const escapedLabel = escapeRegExp(label);
+  const match = html.match(new RegExp(`${escapedLabel}[\\s\\S]{0,1500}?<p[^>]*>([\\s\\S]*?)<\/p>`, "i"));
+  const displayText = cleanHtmlText(match?.[1]) ?? "";
+  const percentage = displayText.match(/\+?\s*(\d+(?:\.\d+)?)\s*%/);
+  const flatRate = displayText.match(/\+?\s*[$]\s*(\d+(?:\.\d+)?)/);
+
+  return {
+    percentage: percentage ? Number(percentage[1]) : undefined,
+    flatRate: flatRate ? Number(flatRate[1]) : undefined,
+  };
+}
+
+function normalizeVGenPrice(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 999 ? value / 100 : value;
+  }
+
+  return firstNumericValue(value);
+}
+
+function getVGenServiceNameFromTitle(value: string | undefined): string | undefined {
+  return value?.match(/^(.*?)\s+by\s+.+?\s+\|\s+VGen$/i)?.[1]?.trim();
+}
+
+function slugifyVGenText(value: string): string {
+  return normalizeComparableText(value).replace(/\s+/g, "-");
+}
+
+function vgenServiceToMarkdown(data: Record<string, unknown>): string {
+  return [
+    "VGen service",
+    `URL: ${asString(data.url) ?? ""}`,
+    asString(data.serviceName) ? `Service: ${asString(data.serviceName)}` : "",
+    typeof data.price === "number" ? `Cost: ${data.currency ?? "USD"} ${data.price}` : "",
+    asString(data.commercialContent) ? `Commercial content: ${asString(data.commercialContent)}` : "",
+    typeof data.commercialContentPercentage === "number" ? `Commercial content percentage: ${data.commercialContentPercentage}%` : "",
+    asString(data.merchandising) ? `Merchandising: ${asString(data.merchandising)}` : "",
+    typeof data.merchandisingPercentage === "number" ? `Merchandising percentage: ${data.merchandisingPercentage}%` : "",
+    asString(data.productImage) ? `Cover image: ${asString(data.productImage)}` : "",
+    asString(data.description) ? `Description:\n${asString(data.description)}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function extractHtmlMetadata(html: string): Record<string, unknown> {
+  return {
+    title: firstString(
+      getHtmlMetaContent(html, "og:title"),
+      getHtmlMetaContent(html, "twitter:title"),
+      getHtmlTitle(html),
+    ),
+    description: firstString(
+      getHtmlMetaContent(html, "og:description"),
+      getHtmlMetaContent(html, "twitter:description"),
+      getHtmlMetaContent(html, "description"),
+    ),
+    image: firstString(
+      getHtmlMetaContent(html, "og:image"),
+      getHtmlMetaContent(html, "twitter:image"),
+    ),
+    canonicalUrl: firstString(
+      getHtmlMetaContent(html, "og:url"),
+      getHtmlLinkHref(html, "canonical"),
+    ),
+    siteName: getHtmlMetaContent(html, "og:site_name"),
+  };
+}
+
+function getInstagramStructuredData(
+  url: string,
+  metadata: Record<string, unknown>,
+): Record<string, unknown> {
+  const image = asString(metadata.image);
+
+  return {
+    title: asString(metadata.title) ?? null,
+    description: asString(metadata.description) ?? null,
+    productImage: image ?? null,
+    imageUrls: image ? [image] : [],
+    sourceUrl: asString(metadata.canonicalUrl) ?? url,
+  };
+}
+
+function instagramMetadataToMarkdown(
+  url: string,
+  metadata: Record<string, unknown>,
+): string {
+  const title = asString(metadata.title);
+  const description = asString(metadata.description);
+  const productImage = asString(metadata.productImage);
+
+  return [
+    "Instagram page",
+    `URL: ${asString(metadata.sourceUrl) ?? url}`,
+    title ? `Title: ${title}` : "",
+    description ? `Description: ${description}` : "",
+    productImage ? `Image: ${productImage}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function getHtmlMetaContent(html: string, key: string): string | undefined {
+  const escapedKey = escapeRegExp(key);
+  const metaTags = html.match(/<meta\s+[^>]*>/gi) ?? [];
+
+  for (const tag of metaTags) {
+    const property = getHtmlAttribute(tag, "property") ?? getHtmlAttribute(tag, "name");
+    if (property && new RegExp(`^${escapedKey}$`, "i").test(property.trim())) {
+      return cleanHtmlText(getHtmlAttribute(tag, "content"));
+    }
+  }
+
+  return undefined;
+}
+
+function getHtmlLinkHref(html: string, rel: string): string | undefined {
+  const linkTags = html.match(/<link\s+[^>]*>/gi) ?? [];
+
+  for (const tag of linkTags) {
+    const relValue = getHtmlAttribute(tag, "rel");
+    if (relValue?.split(/\s+/).some((value) => value.toLowerCase() === rel.toLowerCase())) {
+      return cleanHtmlText(getHtmlAttribute(tag, "href"));
+    }
+  }
+
+  return undefined;
+}
+
+function getHtmlTitle(html: string): string | undefined {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return cleanHtmlText(match?.[1]);
+}
+
+function getHtmlAttribute(tag: string, name: string): string | undefined {
+  const pattern = new RegExp(
+    `\\s${escapeRegExp(name)}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>]+))`,
+    "i",
+  );
+  const match = tag.match(pattern);
+  return match?.[1] ?? match?.[2] ?? match?.[3];
+}
+
+function cleanHtmlText(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const cleaned = decodeHtmlEntities(value.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+  return cleaned || undefined;
+}
+
+function decodeHtmlEntities(value: string): string {
+  const namedEntities: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: "\"",
+  };
+
+  return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity: string) => {
+    if (entity.startsWith("#x")) {
+      const codePoint = Number.parseInt(entity.slice(2), 16);
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
+    }
+
+    if (entity.startsWith("#")) {
+      const codePoint = Number.parseInt(entity.slice(1), 10);
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
+    }
+
+    return namedEntities[entity.toLowerCase()] ?? match;
+  });
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function fetchCodaSchema(
   docId: string,
   tableId: string,
@@ -1060,7 +1567,8 @@ function shouldSkipAiExtraction(scraped: ScrapeResult): boolean {
       (
         source === "shopify-product-json" ||
         source === "amazon-product-json" ||
-        source === "etsy-listing-json"
+        source === "etsy-listing-json" ||
+        source === "vgen-service-html"
       ),
   );
 }
@@ -1093,6 +1601,11 @@ function getStructuredProductColumnValue(
 ): unknown {
   const normalizedName = normalizeComparableText(column.name);
   const type = column.type.toLowerCase();
+  const vgenValue = getVGenServiceColumnValue(product, metadata, column);
+
+  if (vgenValue !== undefined) {
+    return vgenValue;
+  }
 
   if (/\b(name|title|product)\b/.test(normalizedName)) {
     return asString(product.title);
@@ -1152,6 +1665,62 @@ function getStructuredProductColumnValue(
 
   if (isMultiValueType(column)) {
     return getStructuredProductOptionValue(product, column);
+  }
+
+  return undefined;
+}
+
+function getVGenServiceColumnValue(
+  product: Record<string, unknown>,
+  metadata: Record<string, unknown>,
+  column: TargetColumn,
+): unknown {
+  if (asString(metadata.source) !== "vgen-service-html") {
+    return undefined;
+  }
+
+  const normalizedName = normalizeComparableText(column.name);
+  const type = column.type.toLowerCase();
+  const wantsNumeric = type.includes("number") || type.includes("numeric") || type.includes("currency") || type.includes("percent");
+
+  if (/\b(artist|creator|seller|vendor)\b/.test(normalizedName)) {
+    return asString(product.artistName);
+  }
+
+  if (/\b(service id)\b/.test(normalizedName)) {
+    return asString(product.serviceId);
+  }
+
+  if (/\b(service slug|slug)\b/.test(normalizedName)) {
+    return asString(product.serviceSlug);
+  }
+
+  if (/\b(service name|service title|name|title|product)\b/.test(normalizedName)) {
+    return firstString(product.serviceName, product.title);
+  }
+
+  if (/\b(commercial|content use|commercial content)\b/.test(normalizedName)) {
+    if (/\b(flat|fee|fixed)\b/.test(normalizedName)) {
+      return product.commercialContentFlatRate;
+    }
+
+    if (/\b(percent|percentage|rate|upcharge)\b/.test(normalizedName) || wantsNumeric) {
+      return product.commercialContentPercentage;
+    }
+
+    return product.commercialContentUseAllowed ?? product.commercialContent;
+  }
+
+  if (/\b(merch|merchandising)\b/.test(normalizedName)) {
+    if (/\b(flat|fee|fixed)\b/.test(normalizedName)) {
+      return product.merchandisingFlatRate;
+    }
+
+    if (/\b(percent|percentage|rate|upcharge)\b/.test(normalizedName) || wantsNumeric) {
+      return product.merchandisingPercentage;
+    }
+
+    return product.merchandising;
   }
 
   return undefined;

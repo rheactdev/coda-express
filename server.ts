@@ -1085,8 +1085,8 @@ function extractVGenServiceData(
   );
   const galleryItems = asArrayOfRecords(service?.galleryItems);
   const imageUrls = dedupeComparableStrings([
-    ...galleryItems.map((item) => asString(item.url)).filter((value): value is string => Boolean(value)),
     asString(metadata.image),
+    ...galleryItems.map((item) => asString(item.url)).filter((value): value is string => Boolean(value)),
   ].filter((value): value is string => Boolean(value)));
   const licenseInfo = asRecord(service?.licenseInfo);
   const commercialContent = getVGenLicenseStatus(asRecord(licenseInfo?.commercialContent));
@@ -1211,11 +1211,11 @@ function getVGenLicenseCost(html: string, label: string): { percentage?: number;
   const match = html.match(new RegExp(`${escapedLabel}[\\s\\S]{0,1500}?<p[^>]*>([\\s\\S]*?)<\/p>`, "i"));
   const displayText = cleanHtmlText(match?.[1]) ?? "";
   const percentage = displayText.match(/\+?\s*(\d+(?:\.\d+)?)\s*%/);
-  const flatRate = displayText.match(/\+?\s*[$]\s*(\d+(?:\.\d+)?)/);
+  const flatRate = displayText.match(/\+?\s*(?:[$]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*[a-zA-Z]{3})/i);
 
   return {
     percentage: percentage ? Number(percentage[1]) : undefined,
-    flatRate: flatRate ? Number(flatRate[1]) : undefined,
+    flatRate: flatRate ? Number(flatRate[1] || flatRate[2]) : undefined,
   };
 }
 

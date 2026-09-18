@@ -1093,7 +1093,8 @@ function extractVGenServiceData(
   const merchandising = getVGenLicenseStatus(asRecord(licenseInfo?.commercialMerchandising));
   const commercialContentCost = getVGenLicenseCost(html, "Commercial: Content");
   const merchandisingCost = getVGenLicenseCost(html, "Commercial: Merchandising");
-  const price = normalizeVGenPrice(service?.basePrice);
+  const displayedPrice = getVGenDisplayedPrice(html);
+  const price = displayedPrice?.amount ?? normalizeVGenPrice(service?.basePrice);
 
   return {
     title: serviceName ?? null,
@@ -1101,7 +1102,7 @@ function extractVGenServiceData(
     description: description ?? null,
     price: price ?? null,
     cost: price ?? null,
-    currency: asString(service?.currency) ?? "USD",
+    currency: displayedPrice?.currency ?? asString(service?.currency) ?? "USD",
     productImage: imageUrls[0] ?? null,
     imageUrls,
     url,
@@ -1119,6 +1120,26 @@ function extractVGenServiceData(
     merchandisingFlatRate: merchandisingCost.flatRate ?? null,
     tags: asStringArray(service?.tags),
   };
+}
+
+function getVGenDisplayedPrice(html: string): { amount: number; currency: string } | undefined {
+  const match = html.match(/<p\b[^>]*class=["']([^"']*)["'][^>]*>([\s\S]*?)<\/p>/i);
+  if (!match || !/\bservicePrice\b/i.test(match[1])) {
+    return undefined;
+  }
+
+  const displayText = cleanHtmlText(match[2]);
+  if (!displayText) {
+    return undefined;
+  }
+
+  const amountMatch = displayText.match(/([€£$¥₹]|[A-Z]{3})\s*([\d,]+(?:\.\d+)?)/i);
+  if (!amountMatch) {
+    return undefined;
+  }
+
+  const amount = Number(amountMatch[2].replace(/,/g, ""));
+  return Number.isFinite(amount) ? { amount, currency: amountMatch[1] } : undefined;
 }
 
 function getVGenServiceFromHtml(
